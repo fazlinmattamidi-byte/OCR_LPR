@@ -29,10 +29,8 @@ import {
 import {
   generateAdaptiveCrops,
   createInnerPlateTextCrop,
-  createDeskewedCrop,
   cropCanvasRegionFast,
   prioritiseTracks,
-  refinePlateCropBox,
   releaseCanvasMemory,
 } from '@/lib/anpr/imageProcessor';
 import { globalBestFrameSelector } from '@/lib/anpr/bestFrameSelector';
@@ -119,7 +117,6 @@ const CROP_SAMPLE_NORMAL_MS = 160;
 const OCR_FIRST_READ_RETRY_MS = 80;
 const OCR_REPEAT_READ_RETRY_MS = 180;
 const OCR_MAX_CONCURRENCY = 4;
-const OCR_TILT_DESKEW_THRESHOLD_RAD = 0.04;
 const OVERLAY_ANGLE_SAMPLE_MS = 140;
 const MAX_OVERLAY_TILT_RAD = 0.35;
 const SCANNER_MAINTENANCE_INTERVAL_MS = 1000;
@@ -135,42 +132,6 @@ function getExpectedMinPlateChars(crop: HTMLCanvasElement): number {
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
-}
-
-function smoothBoundingBox(
-  previous: ActiveTrack['bbox'] | undefined,
-  next: ActiveTrack['bbox'],
-  alpha = 0.55
-): ActiveTrack['bbox'] {
-  if (!previous) return { ...next };
-
-  return {
-    x: previous.x * (1 - alpha) + next.x * alpha,
-    y: previous.y * (1 - alpha) + next.y * alpha,
-    width: previous.width * (1 - alpha) + next.width * alpha,
-    height: previous.height * (1 - alpha) + next.height * alpha,
-    confidence: next.confidence,
-  };
-}
-
-function getBrowserOcrConcurrencyCap(): number {
-  if (typeof navigator === 'undefined') return 2;
-
-  const ua = navigator.userAgent || '';
-  const platform = navigator.platform || '';
-  const maxTouchPoints = (navigator as any).maxTouchPoints || 0;
-  const cores = navigator.hardwareConcurrency || 4;
-  const isIOS =
-    /iPad|iPhone|iPod/i.test(ua) ||
-    (platform === 'MacIntel' && maxTouchPoints > 1);
-  const isMobile = isIOS || /Android|Mobile/i.test(ua);
-  const isFirefox = /Firefox|FxiOS/i.test(ua);
-  const isSafari =
-    /Safari/i.test(ua) &&
-    !/Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS|Android/i.test(ua);
-
-  if (isMobile || isSafari || isFirefox) return 2;
-  return cores >= 8 ? 3 : 2;
 }
 
 function pruneCooldownMap(cooldowns: Map<string, number>, cooldownMs: number, now: number): void {
@@ -937,11 +898,8 @@ export default function ScannerPage() {
       // ── Step 3: Best Frame Selection (Only on Confirmed Tracks) ──
       const cropSampleNow = loopNow;
       confirmedTracks.forEach(track => {
-        const refinedBox = refinePlateCropBox(processingCanvas, track.bbox);
-        track.ocrBbox = smoothBoundingBox(track.ocrBbox, refinedBox, 0.55);
-
         if (!track.lastOverlayAngleAt || cropSampleNow - track.lastOverlayAngleAt >= OVERLAY_ANGLE_SAMPLE_MS) {
-          track.overlayAngle = estimatePlateOverlayAngle(processingCanvas, track.ocrBbox, track.overlayAngle ?? 0);
+          track.overlayAngle = estimatePlateOverlayAngle(processingCanvas, track.bbox, track.overlayAngle ?? 0);
           track.lastOverlayAngleAt = cropSampleNow;
         }
 
@@ -952,8 +910,8 @@ export default function ScannerPage() {
           return;
         }
 
-        const cropCanvas = cropCanvasRegionFast(processingCanvas, track.ocrBbox);
-        globalBestFrameSelector.addCropCandidate(track.trackNumber, cropCanvas, track.ocrBbox);
+        const cropCanvas = cropCanvasRegionFast(processingCanvas, track.bbox);
+        globalBestFrameSelector.addCropCandidate(track.trackNumber, cropCanvas, track.bbox);
         track.lastCropSampledAt = cropSampleNow;
       });
 
@@ -985,13 +943,12 @@ export default function ScannerPage() {
 
       const maxOcrConcurrency = Math.min(
         OCR_MAX_CONCURRENCY,
-        getBrowserOcrConcurrencyCap(),
         Math.max(1, s.maxOcrConcurrency || INITIAL_SETTINGS.maxOcrConcurrency)
       );
       const priorityIds = prioritiseTracks(
         confirmedTracks.map(t => ({
           trackId: t.trackId,
-          bbox: t.ocrBbox ?? t.bbox,
+          bbox: t.bbox,
           framesSeen: t.framesSeen,
           ocrState: t.ocrState,
           lastOcrAttemptAt: t.lastOcrAttemptAt,
@@ -1013,16 +970,15 @@ export default function ScannerPage() {
         if (track.lastOcrAttemptAt && now - track.lastOcrAttemptAt < retryDelay) continue;
 
         const minReadableWidth = Math.max(40, s.minCropWidth || INITIAL_SETTINGS.minCropWidth);
-        const cropBox = track.ocrBbox ?? refinePlateCropBox(canvas, track.bbox);
         const canReadFirstFrame = track.framesSeen >= 2 || track.bbox.confidence >= 0.60;
-        if (!canReadFirstFrame || cropBox.width < minReadableWidth) {
+        if (!canReadFirstFrame || track.bbox.width < minReadableWidth) {
           track.ocrState = 'COLLECTING';
           continue;
         }
 
         const bestFrameEntry = globalBestFrameSelector.getBestCrop(track.trackNumber);
         const targetCropFromBest = !!bestFrameEntry?.canvas;
-        const targetCrop = bestFrameEntry?.canvas ?? cropCanvasRegionFast(canvas, cropBox);
+        const targetCrop = bestFrameEntry?.canvas ?? cropCanvasRegionFast(canvas, track.bbox);
         const qualityReport = bestFrameEntry?.quality || { overallScore: 0.6, recommendation: 'MARGINAL' as const };
         // Only skip truly unusable frames — MARGINAL frames go through to OCR.
         // The best-frame selector has already picked the sharpest available crop.
@@ -1048,12 +1004,7 @@ export default function ScannerPage() {
           try {
             if (!targetCropFromBest) rememberTransientCanvas(targetCrop);
 
-            const shouldDeskew = Math.abs(track.overlayAngle ?? 0) >= OCR_TILT_DESKEW_THRESHOLD_RAD;
-            const deskewedCrop = shouldDeskew ? createDeskewedCrop(targetCrop, track.overlayAngle ?? 0) : null;
-            rememberTransientCanvas(deskewedCrop);
-
-            const ocrBaseCrop = deskewedCrop ?? targetCrop;
-            const innerTextCrop = createInnerPlateTextCrop(ocrBaseCrop);
+            const innerTextCrop = createInnerPlateTextCrop(targetCrop);
             rememberTransientCanvas(innerTextCrop);
 
             const innerCrops = generateAdaptiveCrops(
@@ -1074,8 +1025,8 @@ export default function ScannerPage() {
               ? ['ORIGINAL', 'DARK_BG', 'INVERTED'] as const
               : ['ORIGINAL', 'SHARPEN', 'DARK_BG', 'INVERTED'] as const;
             const adaptiveCrops = generateAdaptiveCrops(
-              ocrBaseCrop,
-              { x: 0, y: 0, width: ocrBaseCrop.width, height: ocrBaseCrop.height, confidence: 1.0 },
+              targetCrop,
+              { x: 0, y: 0, width: targetCrop.width, height: targetCrop.height, confidence: 1.0 },
               360,
               108,
               [...fullCropVariants]
@@ -1089,10 +1040,10 @@ export default function ScannerPage() {
             const maxCandidateCrops = activeTrackLoad >= 3 ? 4 : 6;
             const candidateCrops = [...innerCrops, ...adaptiveCrops].slice(0, maxCandidateCrops);
             const fallbackCrop = {
-              canvas: ocrBaseCrop,
-              isTwoLine: ocrBaseCrop.width / Math.max(1, ocrBaseCrop.height) < 2.3,
+              canvas: targetCrop,
+              isTwoLine: targetCrop.width / Math.max(1, targetCrop.height) < 2.3,
             };
-            const expectedMinChars = getExpectedMinPlateChars(ocrBaseCrop);
+            const expectedMinChars = getExpectedMinPlateChars(targetCrop);
 
             let text = '';
             let conf = 0;
@@ -1240,9 +1191,8 @@ export default function ScannerPage() {
     }
 
     tracks.forEach(track => {
-      // Use the refined OCR box for display when available, so oversized detector
-      // boxes still show the actual plate/text area.
-      const { x, y, width, height } = track.ocrBbox ?? track.smoothBbox;
+      // Use smoothBbox for display so camera shake doesn't make boxes jitter.
+      const { x, y, width, height } = track.smoothBbox;
       const color = getTrackColor(track);
       const label = getTrackStatusLabel(track);
       const reading = getTrackPlateText(track);

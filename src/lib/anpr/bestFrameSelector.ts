@@ -17,9 +17,9 @@ export interface FrameCropEntry {
 
 export class BestFrameSelector {
   private trackBuffers: Map<number, FrameCropEntry[]> = new Map();
-  private maxBufferSize: number = 4;
-  private maxEntryAgeMs: number = 1600;
-  private maxTrackBuffers: number = 12;
+  private maxBufferSize: number = 6;
+  private maxEntryAgeMs: number = 5000;
+  private maxTrackBuffers: number = 16;
 
   private releaseEntry(entry: FrameCropEntry): void {
     entry.canvas.width = 0;
