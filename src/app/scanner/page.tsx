@@ -671,6 +671,43 @@ export default function ScannerPage() {
           ? 'POSSIBLE'
           : 'NONE';
 
+      track.matchType = resolvedMatchType;
+      track.matchedVehicle = searchRes.matchedVehicle ?? undefined;
+      track.possibleMatchVehicles = searchRes.possibleMatches ?? [];
+      track.ocrState = track.matchType === 'EXACT' ? 'MATCHED' : track.matchType === 'POSSIBLE' ? 'POSSIBLE MATCH' : 'NO CASE';
+      track.cooldownActive = true;
+
+      if (resolvedMatchType === 'EXACT') {
+        if (settingsRef.current.soundEnabled) playAlertSound('EXACT_MATCH');
+        if (settingsRef.current.vibrationEnabled) triggerVibration([200, 100, 200, 100]);
+
+        const entry: MatchEntry = {
+          type: 'EXACT',
+          plate,
+          trackId: track.trackId,
+          vehicle: searchRes.matchedVehicle,
+          possibleMatches: [],
+          confidence,
+          timestamp: now,
+          dismissed: false,
+        };
+        setMatchQueue(q => [...q.filter(m => m.plate !== plate), entry]);
+
+      } else if (resolvedMatchType === 'POSSIBLE') {
+        if (settingsRef.current.soundEnabled) playAlertSound('POSSIBLE_MATCH');
+        const entry: MatchEntry = {
+          type: 'POSSIBLE',
+          plate,
+          trackId: track.trackId,
+          vehicle: null,
+          possibleMatches: searchRes.possibleMatches ?? [],
+          confidence,
+          timestamp: now,
+          dismissed: false,
+        };
+        setMatchQueue(q => [...q.filter(m => m.plate !== plate), entry]);
+      }
+
       const scanRes = await fetch('/api/scans', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -687,50 +724,24 @@ export default function ScannerPage() {
         }),
       }).then(r => r.json());
 
-      track.matchType = resolvedMatchType;
-      track.matchedVehicle = searchRes.matchedVehicle ?? undefined;
-      track.possibleMatchVehicles = searchRes.possibleMatches ?? [];
-      track.ocrState = track.matchType === 'EXACT' ? 'MATCHED' : track.matchType === 'POSSIBLE' ? 'POSSIBLE MATCH' : 'NO CASE';
-
-      if (searchRes.matchType === 'EXACT') {
-        if (settingsRef.current.soundEnabled) playAlertSound('EXACT_MATCH');
-        if (settingsRef.current.vibrationEnabled) triggerVibration([200, 100, 200, 100]);
-
-        const entry: MatchEntry = {
-          type: 'EXACT',
-          plate,
-          trackId: track.trackId,
-          vehicle: searchRes.matchedVehicle,
-          possibleMatches: [],
-          confidence,
-          scanId: scanRes.scanEvent?.id,
-          timestamp: now,
-          dismissed: false,
-        };
-        setMatchQueue(q => [...q.filter(m => m.plate !== plate), entry]);
-
-      } else if (searchRes.matchType === 'POSSIBLE') {
-        if (settingsRef.current.soundEnabled) playAlertSound('POSSIBLE_MATCH');
-        const entry: MatchEntry = {
-          type: 'POSSIBLE',
-          plate,
-          trackId: track.trackId,
-          vehicle: null,
-          possibleMatches: searchRes.possibleMatches ?? [],
-          confidence,
-          scanId: scanRes.scanEvent?.id,
-          timestamp: now,
-          dismissed: false,
-        };
-        setMatchQueue(q => [...q.filter(m => m.plate !== plate), entry]);
+      if (scanRes.scanEvent?.id && (resolvedMatchType === 'EXACT' || resolvedMatchType === 'POSSIBLE')) {
+        setMatchQueue(q => q.map(entry =>
+          entry.plate === plate && entry.trackId === track.trackId
+            ? { ...entry, scanId: scanRes.scanEvent.id }
+            : entry
+        ));
       }
 
       track.ocrState = 'COOLDOWN';
-      track.cooldownActive = true;
       track.scanEventId = scanRes.scanEvent?.id;
     } catch (err) {
       console.warn('[Scanner] DB match error:', err);
-      track.ocrState = 'COLLECTING';
+      if (track.matchType) {
+        track.ocrState = 'COOLDOWN';
+        track.cooldownActive = true;
+      } else {
+        track.ocrState = 'COLLECTING';
+      }
     }
   }, []);
 
