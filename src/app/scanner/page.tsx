@@ -48,6 +48,7 @@ import {
   AdmissionBenchmarkResult,
 } from '@/lib/anpr/runtimeManager';
 import { getActivePpOcrProvider, isPpOcrReady, ActiveOcrProvider } from '@/lib/anpr/ppOcrEngine';
+import { validateMalaysianPattern } from '@/lib/anpr/patterns';
 
 interface MatchEntry {
   type: 'EXACT' | 'POSSIBLE';
@@ -112,8 +113,8 @@ const DETECTION_MIN_DELAY_MS = 16;
 const DETECTOR_VALIDATION_INTERVAL_MS = 2000;
 const CROP_SAMPLE_FAST_MS = 90;
 const CROP_SAMPLE_NORMAL_MS = 160;
-const OCR_FIRST_READ_RETRY_MS = 120;
-const OCR_REPEAT_READ_RETRY_MS = 260;
+const OCR_FIRST_READ_RETRY_MS = 80;
+const OCR_REPEAT_READ_RETRY_MS = 180;
 const OCR_MAX_CONCURRENCY = 4;
 const OVERLAY_ANGLE_SAMPLE_MS = 140;
 const MAX_OVERLAY_TILT_RAD = 0.35;
@@ -127,6 +128,37 @@ function getExpectedMinPlateChars(crop: HTMLCanvasElement): number {
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function countPlateChars(text: string): { letters: number; digits: number } {
+  return {
+    letters: (text.match(/[A-Z]/g) || []).length,
+    digits: (text.match(/[0-9]/g) || []).length,
+  };
+}
+
+function isPlausiblePlateCandidate(
+  text: string,
+  expectedMinChars: number,
+  patternScore: number
+): boolean {
+  if (!text || text.length < 3) return false;
+
+  const { letters, digits } = countPlateChars(text);
+  if (letters === 0 || digits === 0) return false;
+
+  const hasEnoughLength = text.length >= expectedMinChars || (text.length >= 3 && patternScore >= 0.85);
+  if (!hasEnoughLength) return false;
+
+  if (text.length >= 5 && digits < 2) return false;
+  if (/^([A-Z0-9]{2,4})\1$/.test(text)) return false;
+
+  return true;
+}
+
+function canCommitNoCasePlate(text: string, patternScore: number, voteCount: number, minVotes: number): boolean {
+  const { digits } = countPlateChars(text);
+  return voteCount >= Math.max(3, minVotes) && patternScore >= 0.55 && digits >= 2;
 }
 
 function estimatePlateOverlayAngle(
@@ -333,6 +365,31 @@ async function attachCameraStream(video: HTMLVideoElement, stream: MediaStream):
   await video.play();
 }
 
+async function applyCameraQualityOptimizations(track: MediaStreamTrack): Promise<void> {
+  if (typeof track.getCapabilities !== 'function' || typeof track.applyConstraints !== 'function') return;
+
+  try {
+    const caps = track.getCapabilities() as any;
+    const advanced: any[] = [];
+
+    if (Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
+      advanced.push({ focusMode: 'continuous' });
+    }
+    if (Array.isArray(caps.exposureMode) && caps.exposureMode.includes('continuous')) {
+      advanced.push({ exposureMode: 'continuous' });
+    }
+    if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes('continuous')) {
+      advanced.push({ whiteBalanceMode: 'continuous' });
+    }
+
+    if (advanced.length > 0) {
+      await track.applyConstraints({ advanced } as any);
+    }
+  } catch (err) {
+    console.warn('[Scanner] Camera quality constraints unavailable:', err);
+  }
+}
+
 function getCameraErrorMessage(err: any): string {
   if (err?.name === 'NotAllowedError') {
     return 'Camera permission denied. Allow camera access in browser settings and retry.';
@@ -505,6 +562,8 @@ export default function ScannerPage() {
 
       const track = stream.getVideoTracks()[0];
       if (track) {
+        await applyCameraQualityOptimizations(track);
+
         const trackSettings = typeof track.getSettings === 'function' ? track.getSettings() : {};
         if (trackSettings.deviceId) {
           setSelectedDeviceId(trackSettings.deviceId);
@@ -886,23 +945,31 @@ export default function ScannerPage() {
             let conf = 0;
             let bestScore = 0;
             let bestPatternScore = 0;
+            let bestPatternValid = false;
 
             for (const crop of candidateCrops.length > 0 ? candidateCrops : [fallbackCrop]) {
               const result = await recognizePlateFromCanvas(crop.canvas, crop.isTwoLine);
               const resultText = result.normalizedPlate || result.text;
+              const pattern = validateMalaysianPattern(resultText);
+              const isPlausible = isPlausiblePlateCandidate(resultText, expectedMinChars, pattern.score);
               const lengthScore = Math.min(1.0, resultText.length / Math.max(expectedMinChars + 1, 6));
-              const isLongEnough = resultText.length >= expectedMinChars || (resultText.length >= 3 && result.patternScore >= 0.85);
-              const partialPenalty = isLongEnough ? 0 : 0.35;
-              const score = result.confidence * 0.50 + result.patternScore * 0.25 + lengthScore * 0.25 - partialPenalty;
+              const plausibilityPenalty = isPlausible ? 0 : 0.75;
+              const score =
+                result.confidence * 0.45 +
+                pattern.score * 0.30 +
+                lengthScore * 0.20 +
+                (pattern.isValid ? 0.10 : 0) -
+                plausibilityPenalty;
 
-              if (resultText && score >= bestScore) {
+              if (resultText && isPlausible && score >= bestScore) {
                 text = resultText;
                 conf = result.confidence;
                 bestScore = score;
-                bestPatternScore = result.patternScore;
+                bestPatternScore = pattern.score;
+                bestPatternValid = pattern.isValid;
               }
 
-              if (resultText && isLongEnough && result.confidence >= 0.25 && result.patternScore >= 0.55 && score >= 0.58) {
+              if (resultText && isPlausible && result.confidence >= 0.25 && pattern.score >= 0.55 && score >= 0.58) {
                 break;
               }
             }
@@ -913,13 +980,14 @@ export default function ScannerPage() {
             // Lower gate: PP-OCR softmax confidence on small/blurry crops
             // can legitimately be 0.25–0.44 — these are valid reads that should
             // accumulate into consensus rather than being discarded.
-            const hasPlausibleLength = text.length >= expectedMinChars || (text.length >= 3 && bestPatternScore >= 0.85);
-            if (text && conf >= 0.25 && hasPlausibleLength) {
+            if (text && conf >= 0.25) {
               addOcrVoteToTrack(updatedTrack, text, conf, qualityReport.overallScore);
               updatedTrack.ocrState = 'CONSENSUS_BUILDING';
 
-              const veryStrongRead = conf >= Math.max(0.60, s.recognitionThreshold) && bestScore >= 0.70;
-              const strongRead = conf >= 0.32 && bestScore >= 0.56;
+              const { digits } = countPlateChars(text);
+              const canFastMatch = bestPatternValid && digits >= (text.length >= 5 ? 2 : 1);
+              const veryStrongRead = canFastMatch && conf >= Math.max(0.60, s.recognitionThreshold) && bestScore >= 0.70;
+              const strongRead = canFastMatch && conf >= 0.32 && bestScore >= 0.56;
               const requiredVotes = veryStrongRead ? 1 : strongRead ? Math.min(2, s.consensusVotes) : s.consensusVotes;
               const confidenceGate = veryStrongRead
                 ? Math.min(s.recognitionThreshold, 0.58)
@@ -931,8 +999,14 @@ export default function ScannerPage() {
                 const matchConfidence = Math.max(consensus.confidence, Math.min(0.98, bestScore));
                 updatedTrack.stabilizedPlate = consensus.normalizedPlate;
                 updatedTrack.stabilizedConfidence = matchConfidence;
+                const noCaseReady = canCommitNoCasePlate(
+                  consensus.normalizedPlate,
+                  bestPatternScore,
+                  consensus.voteCount,
+                  s.consensusVotes
+                );
                 await runDatabaseMatch(updatedTrack, consensus.normalizedPlate, matchConfidence, {
-                  commitNoCase: !veryStrongRead,
+                  commitNoCase: noCaseReady,
                 });
               }
             } else {
@@ -1226,19 +1300,33 @@ export default function ScannerPage() {
         {(() => {
           const activeWithPlate = tracksList.find(t => t.isConfirmed && t.stabilizedPlate) || tracksList.find(t => t.stabilizedPlate);
           if (activeWithPlate && activeWithPlate.stabilizedPlate) {
-            const isMatch = activeWithPlate.matchType === 'EXACT' || activeWithPlate.matchType === 'POSSIBLE';
-            const badgeBg = isMatch
-              ? (activeWithPlate.matchType === 'EXACT' ? 'bg-rose-950/90 text-rose-300 border-rose-500/50' : 'bg-amber-950/90 text-amber-300 border-amber-500/50')
-              : 'bg-slate-900/90 text-slate-300 border-slate-700';
+            const badgeBg = activeWithPlate.matchType === 'EXACT'
+              ? 'bg-rose-950/90 text-rose-300 border-rose-500/50'
+              : activeWithPlate.matchType === 'POSSIBLE'
+                ? 'bg-amber-950/90 text-amber-300 border-amber-500/50'
+                : activeWithPlate.matchType === 'NONE'
+                  ? 'bg-slate-900/90 text-slate-300 border-slate-700'
+                  : 'bg-[#062936]/90 text-[#00d8f6] border-[#00d8f6]/40';
 
-            const statusLabel = isMatch
-              ? (activeWithPlate.matchType === 'EXACT' ? '🚨 REPO MATCH FOUND' : '⚠️ POSSIBLE MATCH')
-              : '✓ NO MATCH IN DATABASE';
+            const statusLabel = activeWithPlate.matchType === 'EXACT'
+              ? 'REPO MATCH FOUND'
+              : activeWithPlate.matchType === 'POSSIBLE'
+                ? 'POSSIBLE MATCH'
+                : activeWithPlate.matchType === 'NONE'
+                  ? 'NO MATCH IN DATABASE'
+                  : 'READING PLATE';
+            const statusIcon = activeWithPlate.matchType === 'EXACT'
+              ? '!'
+              : activeWithPlate.matchType === 'POSSIBLE'
+                ? '!'
+                : activeWithPlate.matchType === 'NONE'
+                  ? '✓'
+                  : '•';
 
             return (
               <div className="absolute top-6 left-1/2 -translate-x-1/2 z-30 transition-all duration-300 pointer-events-none">
                 <div className={`px-5 py-2.5 rounded-full font-semibold text-xs shadow-2xl border backdrop-blur-md flex items-center gap-2 ${badgeBg}`}>
-                   <span className="font-bold">{statusLabel}</span>
+                   <span className="font-bold">{statusIcon} {statusLabel}</span>
                    <span className="opacity-40">|</span>
                    <span className="font-mono font-extrabold text-white text-sm tracking-wider">{activeWithPlate.stabilizedPlate}</span>
                 </div>

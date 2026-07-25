@@ -453,17 +453,47 @@ function applyFiltersAndNMS(
 
   // Lower NMS threshold (e.g. 0.35) = MORE aggressive suppression of overlapping boxes
   const effectiveThreshold = Math.min(iouThreshold, 0.35);
-  return applyNMS(filtered, effectiveThreshold);
+  return applyNMS(filtered, effectiveThreshold, canvasWidth, canvasHeight).slice(0, 12);
 }
 
-function applyNMS(boxes: DetectedPlateBox[], iouThreshold: number): DetectedPlateBox[] {
-  const sorted = [...boxes].sort((a, b) => b.confidence - a.confidence);
+function getBoxArea(box: DetectedPlateBox): number {
+  return box.bbox.width * box.bbox.height;
+}
+
+function getBoxRank(box: DetectedPlateBox, frameArea: number): number {
+  const areaScore = Math.min(1, getBoxArea(box) / Math.max(1, frameArea * 0.08));
+  return box.confidence * 0.68 + areaScore * 0.32;
+}
+
+function isMostlyContained(inner: BoundingBox, outer: BoundingBox): boolean {
+  const cx = inner.x + inner.width / 2;
+  const cy = inner.y + inner.height / 2;
+  const centreInside =
+    cx >= outer.x &&
+    cx <= outer.x + outer.width &&
+    cy >= outer.y &&
+    cy <= outer.y + outer.height;
+
+  return centreInside && inner.width * inner.height < outer.width * outer.height * 0.65;
+}
+
+function applyNMS(
+  boxes: DetectedPlateBox[],
+  iouThreshold: number,
+  canvasWidth: number,
+  canvasHeight: number
+): DetectedPlateBox[] {
+  const frameArea = canvasWidth * canvasHeight;
+  const sorted = [...boxes].sort((a, b) => getBoxRank(b, frameArea) - getBoxRank(a, frameArea));
   const selected: DetectedPlateBox[] = [];
 
   for (const box of sorted) {
     let keep = true;
     for (const sel of selected) {
-      if (calculateIoU(box.bbox, sel.bbox) > iouThreshold) {
+      if (
+        calculateIoU(box.bbox, sel.bbox) > iouThreshold ||
+        isMostlyContained(box.bbox, sel.bbox)
+      ) {
         keep = false;
         break;
       }
