@@ -49,6 +49,7 @@ export interface ActiveTrack {
   possibleMatchVehicles?: any[];
 
   cooldownActive: boolean;
+  cooldownStartedAt?: number;
   lastSearchedAt?: number;
   scanEventId?: string;
 

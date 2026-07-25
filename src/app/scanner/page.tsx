@@ -122,6 +122,7 @@ const MAX_OVERLAY_TILT_RAD = 0.35;
 const SCANNER_MAINTENANCE_INTERVAL_MS = 1000;
 const COOLDOWN_MAP_MAX_ENTRIES = 120;
 const MATCH_ALERT_LIMIT = 6;
+const TRACK_RESULT_HOLD_MS = 900;
 
 function getExpectedMinPlateChars(crop: HTMLCanvasElement): number {
   const aspect = crop.width / Math.max(1, crop.height);
@@ -153,6 +154,27 @@ function pruneCooldownMap(cooldowns: Map<string, number>, cooldownMs: number, no
 
 function enqueueMatchEntry(queue: MatchEntry[], entry: MatchEntry): MatchEntry[] {
   return [...queue.filter(m => m.plate !== entry.plate), entry].slice(-MATCH_ALERT_LIMIT);
+}
+
+function resetTrackForNextPlate(track: ActiveTrack): void {
+  track.ocrState = 'COLLECTING';
+  track.ocrRunning = false;
+  track.ocrJobQueued = false;
+  track.cooldownActive = false;
+  track.votes.clear();
+  track.cropSamples = [];
+
+  delete track.cooldownStartedAt;
+  delete track.lastCropSampledAt;
+  delete track.lastOcrAttemptAt;
+  delete track.lastOcrCompletedAt;
+  delete track.lastSearchedAt;
+  delete track.stabilizedPlate;
+  delete track.stabilizedConfidence;
+  delete track.matchType;
+  delete track.matchedVehicle;
+  delete track.possibleMatchVehicles;
+  delete track.scanEventId;
 }
 
 function drawRoundedRect(
@@ -693,7 +715,12 @@ export default function ScannerPage() {
     const lastSearch = cooldownMap.current.get(plate) ?? 0;
     const trackSearchThrottleMs = commitNoCase ? 0 : 1000;
 
-    if (commitNoCase && now - lastSearch < cooldownMs) return;
+    if (commitNoCase && now - lastSearch < cooldownMs) {
+      track.ocrState = 'COOLDOWN';
+      track.cooldownActive = true;
+      track.cooldownStartedAt = now;
+      return;
+    }
     if (trackSearchThrottleMs > 0 && track.lastSearchedAt && now - track.lastSearchedAt < trackSearchThrottleMs) return;
     track.lastSearchedAt = now;
 
@@ -779,6 +806,7 @@ export default function ScannerPage() {
 
       track.ocrState = 'COOLDOWN';
       track.cooldownActive = true;
+      track.cooldownStartedAt = Date.now();
       track.scanEventId = scanRes.scanEvent?.id;
     } catch (err) {
       console.warn('[Scanner] DB match error:', err);
@@ -882,6 +910,21 @@ export default function ScannerPage() {
       const confirmedTracks = trackerRef.current.getActiveTracks(true); // Only confirmed tracks
       const displayTracks = s.debugMode ? allTracks : confirmedTracks;
       const loopNow = Date.now();
+
+      confirmedTracks.forEach(track => {
+        if (track.cooldownActive && !track.cooldownStartedAt) {
+          track.cooldownStartedAt = loopNow;
+        }
+
+        if (
+          track.cooldownActive &&
+          track.cooldownStartedAt &&
+          loopNow - track.cooldownStartedAt >= TRACK_RESULT_HOLD_MS
+        ) {
+          resetTrackForNextPlate(track);
+          globalBestFrameSelector.clearTrack(track.trackNumber);
+        }
+      });
 
       if (loopNow - lastMaintenanceTs.current >= SCANNER_MAINTENANCE_INTERVAL_MS) {
         const activeTrackNumbers = new Set(allTracks.map(track => track.trackNumber));
