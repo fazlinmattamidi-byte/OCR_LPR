@@ -28,6 +28,7 @@ import {
 } from '@/lib/anpr/yoloDetector';
 import {
   generateAdaptiveCrops,
+  createInnerPlateTextCrop,
   cropCanvasRegionFast,
   prioritiseTracks,
 } from '@/lib/anpr/imageProcessor';
@@ -96,6 +97,13 @@ const CROP_SAMPLE_NORMAL_MS = 160;
 const OCR_FIRST_READ_RETRY_MS = 120;
 const OCR_REPEAT_READ_RETRY_MS = 260;
 const OCR_MAX_CONCURRENCY = 4;
+
+function getExpectedMinPlateChars(crop: HTMLCanvasElement): number {
+  const aspect = crop.width / Math.max(1, crop.height);
+  if (aspect >= 3.0) return 5;
+  if (aspect >= 2.3) return 4;
+  return 3;
+}
 
 function getCameraPreflightError(): string | null {
   if (typeof window === 'undefined') return null;
@@ -747,6 +755,14 @@ export default function ScannerPage() {
 
         (async () => {
           try {
+            const innerTextCrop = createInnerPlateTextCrop(targetCrop);
+            const innerCrops = generateAdaptiveCrops(
+              innerTextCrop,
+              { x: 0, y: 0, width: innerTextCrop.width, height: innerTextCrop.height, confidence: 1.0 },
+              360,
+              108,
+              ['ORIGINAL', 'INVERTED']
+            );
             const adaptiveCrops = generateAdaptiveCrops(
               targetCrop,
               { x: 0, y: 0, width: targetCrop.width, height: targetCrop.height, confidence: 1.0 },
@@ -754,27 +770,34 @@ export default function ScannerPage() {
               108,
               ['ORIGINAL', 'SHARPEN', 'DARK_BG', 'INVERTED']
             );
-            const candidateCrops = adaptiveCrops.slice(0, 4);
+            const candidateCrops = [...innerCrops, ...adaptiveCrops].slice(0, 6);
             const fallbackCrop = {
               canvas: targetCrop,
               isTwoLine: targetCrop.width / Math.max(1, targetCrop.height) < 2.3,
             };
+            const expectedMinChars = getExpectedMinPlateChars(targetCrop);
 
             let text = '';
             let conf = 0;
             let bestScore = 0;
+            let bestPatternScore = 0;
 
             for (const crop of candidateCrops.length > 0 ? candidateCrops : [fallbackCrop]) {
               const result = await recognizePlateFromCanvas(crop.canvas, crop.isTwoLine);
-              const score = result.confidence * 0.65 + result.patternScore * 0.35;
+              const resultText = result.normalizedPlate || result.text;
+              const lengthScore = Math.min(1.0, resultText.length / Math.max(expectedMinChars + 1, 6));
+              const isLongEnough = resultText.length >= expectedMinChars || (resultText.length >= 3 && result.patternScore >= 0.85);
+              const partialPenalty = isLongEnough ? 0 : 0.35;
+              const score = result.confidence * 0.50 + result.patternScore * 0.25 + lengthScore * 0.25 - partialPenalty;
 
-              if (result.text && score >= bestScore) {
-                text = result.text;
+              if (resultText && score >= bestScore) {
+                text = resultText;
                 conf = result.confidence;
                 bestScore = score;
+                bestPatternScore = result.patternScore;
               }
 
-              if (result.text && result.confidence >= 0.30 && result.patternScore >= 0.55) {
+              if (resultText && isLongEnough && result.confidence >= 0.25 && result.patternScore >= 0.55 && score >= 0.58) {
                 break;
               }
             }
@@ -785,12 +808,13 @@ export default function ScannerPage() {
             // Lower gate: PP-OCR softmax confidence on small/blurry crops
             // can legitimately be 0.25–0.44 — these are valid reads that should
             // accumulate into consensus rather than being discarded.
-            if (text && conf >= 0.25) {
+            const hasPlausibleLength = text.length >= expectedMinChars || (text.length >= 3 && bestPatternScore >= 0.85);
+            if (text && conf >= 0.25 && hasPlausibleLength) {
               addOcrVoteToTrack(updatedTrack, text, conf, qualityReport.overallScore);
               updatedTrack.ocrState = 'CONSENSUS_BUILDING';
 
-              const veryStrongRead = conf >= Math.max(0.62, s.recognitionThreshold) && bestScore >= 0.78;
-              const strongRead = conf >= 0.35 && bestScore >= 0.68;
+              const veryStrongRead = conf >= Math.max(0.60, s.recognitionThreshold) && bestScore >= 0.70;
+              const strongRead = conf >= 0.32 && bestScore >= 0.56;
               const requiredVotes = veryStrongRead ? 1 : strongRead ? Math.min(2, s.consensusVotes) : s.consensusVotes;
               const confidenceGate = veryStrongRead
                 ? Math.min(s.recognitionThreshold, 0.58)

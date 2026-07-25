@@ -570,6 +570,28 @@ export function cropCanvasRegionFast(
   return cropCanvas;
 }
 
+export function createInnerPlateTextCrop(sourceCanvas: HTMLCanvasElement): HTMLCanvasElement {
+  const output = document.createElement('canvas');
+  output.width = sourceCanvas.width;
+  output.height = sourceCanvas.height;
+
+  const ctx = output.getContext('2d', { willReadFrequently: true });
+  if (!ctx || sourceCanvas.width === 0 || sourceCanvas.height === 0) return output;
+
+  const aspect = sourceCanvas.width / Math.max(1, sourceCanvas.height);
+  const isTwoLine = aspect < 2.3;
+  const marginX = isTwoLine ? 0.04 : 0.06;
+  const marginY = isTwoLine ? 0.06 : 0.18;
+
+  const srcX = Math.round(sourceCanvas.width * marginX);
+  const srcY = Math.round(sourceCanvas.height * marginY);
+  const srcW = Math.max(1, Math.round(sourceCanvas.width * (1 - marginX * 2)));
+  const srcH = Math.max(1, Math.round(sourceCanvas.height * (1 - marginY * 2)));
+
+  ctx.drawImage(sourceCanvas, srcX, srcY, srcW, srcH, 0, 0, output.width, output.height);
+  return output;
+}
+
 export function prioritiseTracks(
   tracks: {
     trackId: string;
