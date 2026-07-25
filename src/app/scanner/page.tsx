@@ -29,8 +29,11 @@ import {
 import {
   generateAdaptiveCrops,
   createInnerPlateTextCrop,
+  createDeskewedCrop,
   cropCanvasRegionFast,
   prioritiseTracks,
+  refinePlateCropBox,
+  releaseCanvasMemory,
 } from '@/lib/anpr/imageProcessor';
 import { globalBestFrameSelector } from '@/lib/anpr/bestFrameSelector';
 import { recognizePlateFromCanvas } from '@/lib/anpr/ocrEngine';
@@ -116,8 +119,12 @@ const CROP_SAMPLE_NORMAL_MS = 160;
 const OCR_FIRST_READ_RETRY_MS = 80;
 const OCR_REPEAT_READ_RETRY_MS = 180;
 const OCR_MAX_CONCURRENCY = 4;
+const OCR_TILT_DESKEW_THRESHOLD_RAD = 0.04;
 const OVERLAY_ANGLE_SAMPLE_MS = 140;
 const MAX_OVERLAY_TILT_RAD = 0.35;
+const SCANNER_MAINTENANCE_INTERVAL_MS = 1000;
+const COOLDOWN_MAP_MAX_ENTRIES = 120;
+const MATCH_ALERT_LIMIT = 6;
 
 function getExpectedMinPlateChars(crop: HTMLCanvasElement): number {
   const aspect = crop.width / Math.max(1, crop.height);
@@ -128,6 +135,88 @@ function getExpectedMinPlateChars(crop: HTMLCanvasElement): number {
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function smoothBoundingBox(
+  previous: ActiveTrack['bbox'] | undefined,
+  next: ActiveTrack['bbox'],
+  alpha = 0.55
+): ActiveTrack['bbox'] {
+  if (!previous) return { ...next };
+
+  return {
+    x: previous.x * (1 - alpha) + next.x * alpha,
+    y: previous.y * (1 - alpha) + next.y * alpha,
+    width: previous.width * (1 - alpha) + next.width * alpha,
+    height: previous.height * (1 - alpha) + next.height * alpha,
+    confidence: next.confidence,
+  };
+}
+
+function getBrowserOcrConcurrencyCap(): number {
+  if (typeof navigator === 'undefined') return 2;
+
+  const ua = navigator.userAgent || '';
+  const platform = navigator.platform || '';
+  const maxTouchPoints = (navigator as any).maxTouchPoints || 0;
+  const cores = navigator.hardwareConcurrency || 4;
+  const isIOS =
+    /iPad|iPhone|iPod/i.test(ua) ||
+    (platform === 'MacIntel' && maxTouchPoints > 1);
+  const isMobile = isIOS || /Android|Mobile/i.test(ua);
+  const isFirefox = /Firefox|FxiOS/i.test(ua);
+  const isSafari =
+    /Safari/i.test(ua) &&
+    !/Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS|Android/i.test(ua);
+
+  if (isMobile || isSafari || isFirefox) return 2;
+  return cores >= 8 ? 3 : 2;
+}
+
+function pruneCooldownMap(cooldowns: Map<string, number>, cooldownMs: number, now: number): void {
+  const maxAgeMs = Math.max(cooldownMs * 2, 30000);
+  for (const [plate, timestamp] of cooldowns.entries()) {
+    if (now - timestamp > maxAgeMs) {
+      cooldowns.delete(plate);
+    }
+  }
+
+  if (cooldowns.size <= COOLDOWN_MAP_MAX_ENTRIES) return;
+
+  const entries = Array.from(cooldowns.entries()).sort((a, b) => b[1] - a[1]);
+  cooldowns.clear();
+  entries.slice(0, COOLDOWN_MAP_MAX_ENTRIES).forEach(([plate, timestamp]) => {
+    cooldowns.set(plate, timestamp);
+  });
+}
+
+function enqueueMatchEntry(queue: MatchEntry[], entry: MatchEntry): MatchEntry[] {
+  return [...queue.filter(m => m.plate !== entry.plate), entry].slice(-MATCH_ALERT_LIMIT);
+}
+
+function drawRoundedRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number
+): void {
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(x, y, width, height, radius);
+    return;
+  }
+
+  const r = Math.min(radius, Math.abs(width) / 2, Math.abs(height) / 2);
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + width - r, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+  ctx.lineTo(x + width, y + height - r);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  ctx.lineTo(x + r, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
 }
 
 function countPlateChars(text: string): { letters: number; digits: number } {
@@ -470,6 +559,7 @@ export default function ScannerPage() {
   const lastFpsTs = useRef(Date.now());
   const cooldownMap = useRef<Map<string, number>>(new Map());
   const activeOcrCount = useRef(0);
+  const lastMaintenanceTs = useRef(0);
 
   const resetLiveScanUi = useCallback(() => {
     trackerRef.current.clear();
@@ -477,6 +567,7 @@ export default function ScannerPage() {
     camFrameCount.current = 0;
     detFrameCount.current = 0;
     activeOcrCount.current = 0;
+    lastMaintenanceTs.current = 0;
     setTracksList([]);
     setPlatesVisible(0);
     setActiveTracksCount(0);
@@ -692,7 +783,7 @@ export default function ScannerPage() {
       track.possibleMatchVehicles = searchRes.possibleMatches ?? [];
       track.ocrState = track.matchType === 'EXACT' ? 'MATCHED' : track.matchType === 'POSSIBLE' ? 'POSSIBLE MATCH' : 'NO CASE';
 
-      if (searchRes.matchType === 'EXACT') {
+      if (resolvedMatchType === 'EXACT') {
         if (settingsRef.current.soundEnabled) playAlertSound('EXACT_MATCH');
         if (settingsRef.current.vibrationEnabled) triggerVibration([200, 100, 200, 100]);
 
@@ -707,9 +798,9 @@ export default function ScannerPage() {
           timestamp: now,
           dismissed: false,
         };
-        setMatchQueue(q => [...q.filter(m => m.plate !== plate), entry]);
+        setMatchQueue(q => enqueueMatchEntry(q, entry));
 
-      } else if (searchRes.matchType === 'POSSIBLE') {
+      } else if (resolvedMatchType === 'POSSIBLE') {
         if (settingsRef.current.soundEnabled) playAlertSound('POSSIBLE_MATCH');
         const entry: MatchEntry = {
           type: 'POSSIBLE',
@@ -722,7 +813,7 @@ export default function ScannerPage() {
           timestamp: now,
           dismissed: false,
         };
-        setMatchQueue(q => [...q.filter(m => m.plate !== plate), entry]);
+        setMatchQueue(q => enqueueMatchEntry(q, entry));
       }
 
       track.ocrState = 'COOLDOWN';
@@ -829,16 +920,28 @@ export default function ScannerPage() {
       const allTracks = trackerRef.current.updateTracks(bboxList);
       const confirmedTracks = trackerRef.current.getActiveTracks(true); // Only confirmed tracks
       const displayTracks = s.debugMode ? allTracks : confirmedTracks;
+      const loopNow = Date.now();
+
+      if (loopNow - lastMaintenanceTs.current >= SCANNER_MAINTENANCE_INTERVAL_MS) {
+        const activeTrackNumbers = new Set(allTracks.map(track => track.trackNumber));
+        globalBestFrameSelector.clearExcept(activeTrackNumbers);
+        globalBestFrameSelector.pruneStale(undefined, activeTrackNumbers, loopNow);
+        pruneCooldownMap(cooldownMap.current, s.duplicateCooldown * 1000, loopNow);
+        lastMaintenanceTs.current = loopNow;
+      }
 
       setPlatesVisible(bboxList.length);
       setActiveTracksCount(confirmedTracks.length); // Update metric to show confirmed count
       setTracksList([...displayTracks]); // UI List
 
       // ── Step 3: Best Frame Selection (Only on Confirmed Tracks) ──
-      const cropSampleNow = Date.now();
+      const cropSampleNow = loopNow;
       confirmedTracks.forEach(track => {
+        const refinedBox = refinePlateCropBox(processingCanvas, track.bbox);
+        track.ocrBbox = smoothBoundingBox(track.ocrBbox, refinedBox, 0.55);
+
         if (!track.lastOverlayAngleAt || cropSampleNow - track.lastOverlayAngleAt >= OVERLAY_ANGLE_SAMPLE_MS) {
-          track.overlayAngle = estimatePlateOverlayAngle(processingCanvas, track.bbox, track.overlayAngle ?? 0);
+          track.overlayAngle = estimatePlateOverlayAngle(processingCanvas, track.ocrBbox, track.overlayAngle ?? 0);
           track.lastOverlayAngleAt = cropSampleNow;
         }
 
@@ -849,8 +952,8 @@ export default function ScannerPage() {
           return;
         }
 
-        const cropCanvas = cropCanvasRegionFast(processingCanvas, track.bbox);
-        globalBestFrameSelector.addCropCandidate(track.trackNumber, cropCanvas, track.bbox);
+        const cropCanvas = cropCanvasRegionFast(processingCanvas, track.ocrBbox);
+        globalBestFrameSelector.addCropCandidate(track.trackNumber, cropCanvas, track.ocrBbox);
         track.lastCropSampledAt = cropSampleNow;
       });
 
@@ -882,12 +985,13 @@ export default function ScannerPage() {
 
       const maxOcrConcurrency = Math.min(
         OCR_MAX_CONCURRENCY,
+        getBrowserOcrConcurrencyCap(),
         Math.max(1, s.maxOcrConcurrency || INITIAL_SETTINGS.maxOcrConcurrency)
       );
       const priorityIds = prioritiseTracks(
         confirmedTracks.map(t => ({
           trackId: t.trackId,
-          bbox: t.bbox,
+          bbox: t.ocrBbox ?? t.bbox,
           framesSeen: t.framesSeen,
           ocrState: t.ocrState,
           lastOcrAttemptAt: t.lastOcrAttemptAt,
@@ -909,14 +1013,16 @@ export default function ScannerPage() {
         if (track.lastOcrAttemptAt && now - track.lastOcrAttemptAt < retryDelay) continue;
 
         const minReadableWidth = Math.max(40, s.minCropWidth || INITIAL_SETTINGS.minCropWidth);
+        const cropBox = track.ocrBbox ?? refinePlateCropBox(canvas, track.bbox);
         const canReadFirstFrame = track.framesSeen >= 2 || track.bbox.confidence >= 0.60;
-        if (!canReadFirstFrame || track.bbox.width < minReadableWidth) {
+        if (!canReadFirstFrame || cropBox.width < minReadableWidth) {
           track.ocrState = 'COLLECTING';
           continue;
         }
 
         const bestFrameEntry = globalBestFrameSelector.getBestCrop(track.trackNumber);
-        const targetCrop = bestFrameEntry?.canvas ?? cropCanvasRegionFast(canvas, track.bbox);
+        const targetCropFromBest = !!bestFrameEntry?.canvas;
+        const targetCrop = bestFrameEntry?.canvas ?? cropCanvasRegionFast(canvas, cropBox);
         const qualityReport = bestFrameEntry?.quality || { overallScore: 0.6, recommendation: 'MARGINAL' as const };
         // Only skip truly unusable frames — MARGINAL frames go through to OCR.
         // The best-frame selector has already picked the sharpest available crop.
@@ -932,8 +1038,24 @@ export default function ScannerPage() {
         activeOcrCount.current++;
 
         (async () => {
+          const transientCanvases: HTMLCanvasElement[] = [];
+          const rememberTransientCanvas = (crop?: HTMLCanvasElement | null) => {
+            if (crop && !transientCanvases.includes(crop)) {
+              transientCanvases.push(crop);
+            }
+          };
+
           try {
-            const innerTextCrop = createInnerPlateTextCrop(targetCrop);
+            if (!targetCropFromBest) rememberTransientCanvas(targetCrop);
+
+            const shouldDeskew = Math.abs(track.overlayAngle ?? 0) >= OCR_TILT_DESKEW_THRESHOLD_RAD;
+            const deskewedCrop = shouldDeskew ? createDeskewedCrop(targetCrop, track.overlayAngle ?? 0) : null;
+            rememberTransientCanvas(deskewedCrop);
+
+            const ocrBaseCrop = deskewedCrop ?? targetCrop;
+            const innerTextCrop = createInnerPlateTextCrop(ocrBaseCrop);
+            rememberTransientCanvas(innerTextCrop);
+
             const innerCrops = generateAdaptiveCrops(
               innerTextCrop,
               { x: 0, y: 0, width: innerTextCrop.width, height: innerTextCrop.height, confidence: 1.0 },
@@ -941,19 +1063,36 @@ export default function ScannerPage() {
               108,
               ['ORIGINAL', 'INVERTED']
             );
+            innerCrops.forEach(crop => {
+              rememberTransientCanvas(crop.canvas);
+              rememberTransientCanvas(crop.topLineCanvas);
+              rememberTransientCanvas(crop.bottomLineCanvas);
+            });
+
+            const activeTrackLoad = Math.max(1, confirmedTracks.length);
+            const fullCropVariants = activeTrackLoad >= 3
+              ? ['ORIGINAL', 'DARK_BG', 'INVERTED'] as const
+              : ['ORIGINAL', 'SHARPEN', 'DARK_BG', 'INVERTED'] as const;
             const adaptiveCrops = generateAdaptiveCrops(
-              targetCrop,
-              { x: 0, y: 0, width: targetCrop.width, height: targetCrop.height, confidence: 1.0 },
+              ocrBaseCrop,
+              { x: 0, y: 0, width: ocrBaseCrop.width, height: ocrBaseCrop.height, confidence: 1.0 },
               360,
               108,
-              ['ORIGINAL', 'SHARPEN', 'DARK_BG', 'INVERTED']
+              [...fullCropVariants]
             );
-            const candidateCrops = [...innerCrops, ...adaptiveCrops].slice(0, 6);
+            adaptiveCrops.forEach(crop => {
+              rememberTransientCanvas(crop.canvas);
+              rememberTransientCanvas(crop.topLineCanvas);
+              rememberTransientCanvas(crop.bottomLineCanvas);
+            });
+
+            const maxCandidateCrops = activeTrackLoad >= 3 ? 4 : 6;
+            const candidateCrops = [...innerCrops, ...adaptiveCrops].slice(0, maxCandidateCrops);
             const fallbackCrop = {
-              canvas: targetCrop,
-              isTwoLine: targetCrop.width / Math.max(1, targetCrop.height) < 2.3,
+              canvas: ocrBaseCrop,
+              isTwoLine: ocrBaseCrop.width / Math.max(1, ocrBaseCrop.height) < 2.3,
             };
-            const expectedMinChars = getExpectedMinPlateChars(targetCrop);
+            const expectedMinChars = getExpectedMinPlateChars(ocrBaseCrop);
 
             let text = '';
             let conf = 0;
@@ -1022,6 +1161,7 @@ export default function ScannerPage() {
           } catch (e) {
             console.warn('[OCR] Error:', e);
           } finally {
+            transientCanvases.forEach(releaseCanvasMemory);
             const t = trackerRef.current.getTrack(trackId);
             if (t) {
               t.ocrRunning = false;
@@ -1100,9 +1240,9 @@ export default function ScannerPage() {
     }
 
     tracks.forEach(track => {
-      // Use smoothBbox for display so camera shake doesn't make boxes jitter.
-      // smoothBbox is EMA-interpolated toward the raw detection each frame.
-      const { x, y, width, height } = track.smoothBbox;
+      // Use the refined OCR box for display when available, so oversized detector
+      // boxes still show the actual plate/text area.
+      const { x, y, width, height } = track.ocrBbox ?? track.smoothBbox;
       const color = getTrackColor(track);
       const label = getTrackStatusLabel(track);
       const reading = getTrackPlateText(track);
@@ -1121,7 +1261,7 @@ export default function ScannerPage() {
       ctx.shadowColor = color;
       ctx.shadowBlur = 8;
       ctx.beginPath();
-      ctx.roundRect(-boxW / 2, -boxH / 2, boxW, boxH, 7);
+      drawRoundedRect(ctx, -boxW / 2, -boxH / 2, boxW, boxH, 7);
       ctx.stroke();
       ctx.restore();
 
@@ -1144,7 +1284,7 @@ export default function ScannerPage() {
         ctx.shadowBlur = 10;
         ctx.fillStyle = color;
         ctx.beginPath();
-        ctx.roundRect(pillX, pillY, pillW, pillH, 6);
+        drawRoundedRect(ctx, pillX, pillY, pillW, pillH, 6);
         ctx.fill();
 
         ctx.shadowBlur = 0;

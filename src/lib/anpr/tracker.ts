@@ -21,6 +21,7 @@ export interface ActiveTrack {
   trackNumber: number;
   bbox: BoundingBox;          // Raw detection bbox (used for IoU / matching / cropping)
   smoothBbox: BoundingBox;    // EMA-smoothed bbox (used strictly for UI overlay rendering)
+  ocrBbox?: BoundingBox;      // Refined plate/text bbox for OCR and overlay display
   predictedBbox?: BoundingBox;
   overlayAngle?: number;
   lastOverlayAngleAt?: number;

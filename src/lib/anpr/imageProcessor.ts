@@ -25,6 +25,191 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+export function releaseCanvasMemory(canvas?: HTMLCanvasElement | null): void {
+  if (!canvas) return;
+  canvas.width = 0;
+  canvas.height = 0;
+}
+
+function getSourceDimensions(sourceCanvas: HTMLCanvasElement | HTMLVideoElement): { width: number; height: number } {
+  if (typeof HTMLVideoElement !== 'undefined' && sourceCanvas instanceof HTMLVideoElement) {
+    return {
+      width: sourceCanvas.videoWidth || sourceCanvas.width || 0,
+      height: sourceCanvas.videoHeight || sourceCanvas.height || 0,
+    };
+  }
+
+  return {
+    width: sourceCanvas.width || 0,
+    height: sourceCanvas.height || 0,
+  };
+}
+
+function lumaAt(data: Uint8ClampedArray, width: number, x: number, y: number): number {
+  const idx = (y * width + x) * 4;
+  return data[idx] * 0.299 + data[idx + 1] * 0.587 + data[idx + 2] * 0.114;
+}
+
+function smoothScores(scores: Float32Array, radius: number): Float32Array {
+  const output = new Float32Array(scores.length);
+  for (let i = 0; i < scores.length; i++) {
+    let sum = 0;
+    let count = 0;
+    const start = Math.max(0, i - radius);
+    const end = Math.min(scores.length - 1, i + radius);
+    for (let j = start; j <= end; j++) {
+      sum += scores[j];
+      count++;
+    }
+    output[i] = count > 0 ? sum / count : scores[i];
+  }
+  return output;
+}
+
+function findScoreBounds(scores: Float32Array, minSpan: number): { start: number; end: number } | null {
+  if (scores.length === 0) return null;
+
+  let sum = 0;
+  let max = 0;
+  for (const score of scores) {
+    sum += score;
+    if (score > max) max = score;
+  }
+
+  if (max <= 0) return null;
+
+  const mean = sum / scores.length;
+  let variance = 0;
+  for (const score of scores) {
+    const delta = score - mean;
+    variance += delta * delta;
+  }
+  variance /= scores.length;
+  const std = Math.sqrt(variance);
+  const threshold = Math.max(mean + std * 0.35, max * 0.24);
+
+  let start = -1;
+  let end = -1;
+  for (let i = 0; i < scores.length; i++) {
+    if (scores[i] >= threshold) {
+      if (start === -1) start = i;
+      end = i;
+    }
+  }
+
+  if (start === -1 || end === -1) return null;
+
+  const span = end - start + 1;
+  if (span < minSpan) {
+    const centre = Math.round((start + end) / 2);
+    start = Math.max(0, centre - Math.floor(minSpan / 2));
+    end = Math.min(scores.length - 1, start + minSpan - 1);
+    start = Math.max(0, end - minSpan + 1);
+  }
+
+  return { start, end };
+}
+
+/**
+ * Tighten an oversized detector box toward the actual high-contrast plate/text band.
+ * This protects OCR when the detector catches bonnet/hood/body area around a zoomed plate.
+ */
+export function refinePlateCropBox(
+  sourceCanvas: HTMLCanvasElement | HTMLVideoElement,
+  bbox: BoundingBox
+): BoundingBox {
+  const { width: sourceWidth, height: sourceHeight } = getSourceDimensions(sourceCanvas);
+  if (sourceWidth <= 0 || sourceHeight <= 0) return bbox;
+
+  const x = clamp(Math.round(bbox.x), 0, Math.max(0, sourceWidth - 1));
+  const y = clamp(Math.round(bbox.y), 0, Math.max(0, sourceHeight - 1));
+  const width = clamp(Math.round(bbox.width), 1, sourceWidth - x);
+  const height = clamp(Math.round(bbox.height), 1, sourceHeight - y);
+  const boundedBox: BoundingBox = { x, y, width, height, confidence: bbox.confidence };
+
+  if (width < 70 || height < 18) return boundedBox;
+
+  if (typeof HTMLCanvasElement === 'undefined' || !(sourceCanvas instanceof HTMLCanvasElement)) {
+    return boundedBox;
+  }
+
+  const ctx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return boundedBox;
+
+  try {
+    const image = ctx.getImageData(x, y, width, height);
+    const { data } = image;
+    const step = Math.max(1, Math.floor(Math.max(width, height) / 260));
+    const rowScores = new Float32Array(height);
+    const colScores = new Float32Array(width);
+
+    for (let py = step; py < height - step; py += step) {
+      for (let px = step; px < width - step; px += step) {
+        const gx = Math.abs(lumaAt(data, width, px + step, py) - lumaAt(data, width, px - step, py));
+        const gy = Math.abs(lumaAt(data, width, px, py + step) - lumaAt(data, width, px, py - step));
+        const edge = gx * 0.75 + gy * 0.55;
+        if (edge < 10) continue;
+
+        rowScores[py] += edge;
+        colScores[px] += edge;
+      }
+    }
+
+    const smoothedRows = smoothScores(rowScores, Math.max(2, Math.round(height / 60)));
+    const smoothedCols = smoothScores(colScores, Math.max(2, Math.round(width / 80)));
+    const rowBounds = findScoreBounds(smoothedRows, Math.max(12, Math.round(height * 0.22)));
+    const colBounds = findScoreBounds(smoothedCols, Math.max(45, Math.round(width * 0.28)));
+
+    if (!rowBounds || !colBounds) return boundedBox;
+
+    const detectedW = colBounds.end - colBounds.start + 1;
+    const detectedH = rowBounds.end - rowBounds.start + 1;
+    const padX = Math.max(8, detectedW * 0.16);
+    const padY = Math.max(6, detectedH * 0.32);
+
+    const refinedX = clamp(Math.round(x + colBounds.start - padX), 0, sourceWidth - 1);
+    const refinedY = clamp(Math.round(y + rowBounds.start - padY), 0, sourceHeight - 1);
+    const refinedRight = clamp(Math.round(x + colBounds.end + padX), refinedX + 1, sourceWidth);
+    const refinedBottom = clamp(Math.round(y + rowBounds.end + padY), refinedY + 1, sourceHeight);
+    const refinedW = refinedRight - refinedX;
+    const refinedH = refinedBottom - refinedY;
+    const refinedAr = refinedW / Math.max(1, refinedH);
+    const originalAr = width / Math.max(1, height);
+    const areaRatio = (refinedW * refinedH) / Math.max(1, width * height);
+
+    if (refinedW < 45 || refinedH < 12) return boundedBox;
+    if (refinedAr < 0.8 || refinedAr > 7.2) return boundedBox;
+    if (areaRatio > 0.92 && originalAr >= 0.8 && originalAr <= 6.5) return boundedBox;
+
+    return {
+      x: refinedX,
+      y: refinedY,
+      width: refinedW,
+      height: refinedH,
+      confidence: bbox.confidence,
+    };
+  } catch {
+    return boundedBox;
+  }
+}
+
+export function createDeskewedCrop(sourceCanvas: HTMLCanvasElement, angleRad: number): HTMLCanvasElement {
+  const output = document.createElement('canvas');
+  output.width = sourceCanvas.width;
+  output.height = sourceCanvas.height;
+
+  const ctx = output.getContext('2d', { willReadFrequently: true });
+  if (!ctx || sourceCanvas.width === 0 || sourceCanvas.height === 0) return output;
+
+  ctx.fillStyle = '#111318';
+  ctx.fillRect(0, 0, output.width, output.height);
+  ctx.translate(output.width / 2, output.height / 2);
+  ctx.rotate(-angleRad);
+  ctx.drawImage(sourceCanvas, -sourceCanvas.width / 2, -sourceCanvas.height / 2);
+
+  return output;
+}
+
 function getAdaptiveCropTargetSize(
   bbox: BoundingBox,
   targetWidth: number,
@@ -542,29 +727,31 @@ export function cropCanvasRegionFast(
   targetHeight: number = 108
 ): HTMLCanvasElement {
   const cropCanvas = document.createElement('canvas');
-  const outputSize = getAdaptiveCropTargetSize(bbox, targetWidth, targetHeight);
+  const cropBox = refinePlateCropBox(sourceCanvas, bbox);
+  const outputSize = getAdaptiveCropTargetSize(cropBox, targetWidth, targetHeight);
 
   let scaleFactor = 1.0;
-  if (bbox.width < 120 || bbox.height < 35) {
+  if (cropBox.width < 90 || cropBox.height < 26) {
+    scaleFactor = 2.0;
+  } else if (cropBox.width < 160 || cropBox.height < 42) {
     scaleFactor = 1.6;
   }
 
-  const scaledW = Math.round(outputSize.width * scaleFactor);
-  const scaledH = Math.round(outputSize.height * scaleFactor);
+  const scaledW = clamp(Math.round(outputSize.width * scaleFactor), 160, 640);
+  const scaledH = clamp(Math.round(outputSize.height * scaleFactor), 48, 224);
   cropCanvas.width = scaledW;
   cropCanvas.height = scaledH;
 
   const ctx = cropCanvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) return cropCanvas;
 
-  const sourceWidth = sourceCanvas.width || (sourceCanvas as HTMLVideoElement).videoWidth;
-  const sourceHeight = sourceCanvas.height || (sourceCanvas as HTMLVideoElement).videoHeight;
-  const padX = bbox.width * 0.08;
-  const padY = bbox.height * 0.12;
-  const srcX = Math.max(0, bbox.x - padX);
-  const srcY = Math.max(0, bbox.y - padY);
-  const srcW = Math.min(sourceWidth - srcX, bbox.width + padX * 2);
-  const srcH = Math.min(sourceHeight - srcY, bbox.height + padY * 2);
+  const { width: sourceWidth, height: sourceHeight } = getSourceDimensions(sourceCanvas);
+  const padX = cropBox.width * 0.12;
+  const padY = cropBox.height * 0.20;
+  const srcX = Math.max(0, cropBox.x - padX);
+  const srcY = Math.max(0, cropBox.y - padY);
+  const srcW = Math.min(sourceWidth - srcX, cropBox.width + padX * 2);
+  const srcH = Math.min(sourceHeight - srcY, cropBox.height + padY * 2);
 
   ctx.drawImage(sourceCanvas, srcX, srcY, srcW, srcH, 0, 0, scaledW, scaledH);
   return cropCanvas;
