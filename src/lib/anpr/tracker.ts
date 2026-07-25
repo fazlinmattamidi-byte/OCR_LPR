@@ -34,6 +34,9 @@ export interface ActiveTrack {
   ocrState: TrackOcrState;
   ocrRunning: boolean;
   ocrJobQueued: boolean;
+  lastCropSampledAt?: number;
+  lastOcrAttemptAt?: number;
+  lastOcrCompletedAt?: number;
 
   votes: Map<string, { count: number; totalConfidence: number }>;
   stabilizedPlate?: string;
@@ -167,6 +170,7 @@ export class PlateTracker {
         track.vx = track.vx * 0.7 + dx * 0.3; // Smooth velocity
         track.vy = track.vy * 0.7 + dy * 0.3;
 
+        const now = Date.now();
         track.bbox = matchedBox;
 
         // EMA smoothing for UI display — alpha=0.35 glides toward new position
@@ -181,6 +185,7 @@ export class PlateTracker {
         };
 
         track.lastSeenFrame = this.frameIndex;
+        track.lastSeenTimestamp = now;
         track.framesSeen++;
         if (track.framesSeen >= this.minConfirmationFrames || track.bbox.confidence >= 0.70) track.isConfirmed = true;
         unassignedHigh.delete(bestIdx);
@@ -216,6 +221,11 @@ export class PlateTracker {
 
       if (bestIdx !== -1) {
         const matchedBox = detectedBoxes[bestIdx];
+        const dx = matchedBox.x - track.bbox.x;
+        const dy = matchedBox.y - track.bbox.y;
+        track.vx = track.vx * 0.75 + dx * 0.25;
+        track.vy = track.vy * 0.75 + dy * 0.25;
+
         track.bbox = matchedBox;
 
         // EMA smoothing for stage-2 (low confidence) matches too
@@ -229,6 +239,7 @@ export class PlateTracker {
         };
 
         track.lastSeenFrame = this.frameIndex;
+        track.lastSeenTimestamp = Date.now();
         track.framesSeen++;
         if (track.framesSeen >= this.minConfirmationFrames || track.bbox.confidence >= 0.70) track.isConfirmed = true;
         unassignedLow.delete(bestIdx);
@@ -246,8 +257,8 @@ export class PlateTracker {
       const num = this.trackCounter++;
       const now = Date.now();
       const newTrack: ActiveTrack = {
-        trackId: `TRK-${this.trackCounter++}`,
-        trackNumber: this.trackCounter - 1,
+        trackId: `TRK-${num}`,
+        trackNumber: num,
         bbox: { ...box },
         smoothBbox: { ...box },
         vx: 0,
@@ -263,7 +274,7 @@ export class PlateTracker {
         ocrJobQueued: false,
         votes: new Map(),
         cooldownActive: false,
-        isConfirmed: box.confidence >= 0.70, // Instantly confirm high confidence plates
+        isConfirmed: box.confidence >= 0.55, // Instantly confirm confident YOLO plates for fast-moving scenes
       };
       this.activeTracks.set(newTrack.trackId, newTrack);
     });
@@ -294,6 +305,12 @@ export class PlateTracker {
   public setLostTrackTimeout(frames: number): void {
     this.lostTrackTimeout = frames;
     this.lostTrackTimeoutMs = frames * 100;
+  }
+
+  public setMaxActiveTracks(maxTracks: number): void {
+    if (Number.isFinite(maxTracks) && maxTracks > 0) {
+      this.maxActiveTracks = Math.max(1, Math.floor(maxTracks));
+    }
   }
 
   public clear(): void {

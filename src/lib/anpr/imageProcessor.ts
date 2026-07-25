@@ -290,7 +290,8 @@ export function generateAdaptiveCrops(
   sourceCanvas: HTMLCanvasElement | HTMLVideoElement,
   bbox: BoundingBox,
   targetWidth: number = 360,
-  targetHeight: number = 108
+  targetHeight: number = 108,
+  variantsOverride?: PreprocessVariant[]
 ): MultiCropResult[] {
   const results: MultiCropResult[] = [];
 
@@ -298,7 +299,7 @@ export function generateAdaptiveCrops(
   const isTwoLine = ar < 2.3;
   const layout: PlateLayout = isTwoLine ? (ar < 1.6 ? 'SQUARE' : 'TWO_LINE') : 'SINGLE_LINE';
 
-  const variants: PreprocessVariant[] = [
+  const variants: PreprocessVariant[] = variantsOverride ?? [
     'ORIGINAL',
     'GRAYSCALE',
     'DEFAULT_CONTRAST',
@@ -534,8 +535,50 @@ export function cropCanvasRegion(
   return crops.length > 0 ? crops[0].canvas : document.createElement('canvas');
 }
 
+export function cropCanvasRegionFast(
+  sourceCanvas: HTMLCanvasElement | HTMLVideoElement,
+  bbox: BoundingBox,
+  targetWidth: number = 360,
+  targetHeight: number = 108
+): HTMLCanvasElement {
+  const cropCanvas = document.createElement('canvas');
+  const outputSize = getAdaptiveCropTargetSize(bbox, targetWidth, targetHeight);
+
+  let scaleFactor = 1.0;
+  if (bbox.width < 120 || bbox.height < 35) {
+    scaleFactor = 1.6;
+  }
+
+  const scaledW = Math.round(outputSize.width * scaleFactor);
+  const scaledH = Math.round(outputSize.height * scaleFactor);
+  cropCanvas.width = scaledW;
+  cropCanvas.height = scaledH;
+
+  const ctx = cropCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return cropCanvas;
+
+  const sourceWidth = sourceCanvas.width || (sourceCanvas as HTMLVideoElement).videoWidth;
+  const sourceHeight = sourceCanvas.height || (sourceCanvas as HTMLVideoElement).videoHeight;
+  const padX = bbox.width * 0.08;
+  const padY = bbox.height * 0.12;
+  const srcX = Math.max(0, bbox.x - padX);
+  const srcY = Math.max(0, bbox.y - padY);
+  const srcW = Math.min(sourceWidth - srcX, bbox.width + padX * 2);
+  const srcH = Math.min(sourceHeight - srcY, bbox.height + padY * 2);
+
+  ctx.drawImage(sourceCanvas, srcX, srcY, srcW, srcH, 0, 0, scaledW, scaledH);
+  return cropCanvas;
+}
+
 export function prioritiseTracks(
-  tracks: { trackId: string; bbox: BoundingBox; framesSeen: number; ocrState: string }[],
+  tracks: {
+    trackId: string;
+    bbox: BoundingBox;
+    framesSeen: number;
+    ocrState: string;
+    lastOcrAttemptAt?: number;
+    voteCount?: number;
+  }[],
   frameWidth: number,
   frameHeight: number,
   maxOcrSlots: number = 3
@@ -557,12 +600,20 @@ export function prioritiseTracks(
       const areaScore = Math.min(1, area / (frameArea * 0.25));
       const stabilityScore = Math.min(1, t.framesSeen / 15);
       const confScore = t.bbox.confidence ?? 0.8;
+      const lastAttemptAge = t.lastOcrAttemptAt ? Date.now() - t.lastOcrAttemptAt : 5000;
+      const fairnessScore = Math.min(1, lastAttemptAge / 1200);
+      const noVoteBoost = (t.voteCount ?? 0) === 0 ? 0.12 : 0;
 
-      const priority = areaScore * 0.35 + confScore * 0.30 + distScore * 0.20 + stabilityScore * 0.15;
+      const priority =
+        areaScore * 0.28 +
+        confScore * 0.25 +
+        distScore * 0.18 +
+        stabilityScore * 0.12 +
+        fairnessScore * 0.17 +
+        noVoteBoost;
       return { trackId: t.trackId, priority };
     });
 
   scored.sort((a, b) => b.priority - a.priority);
   return scored.slice(0, maxOcrSlots).map(s => s.trackId);
 }
-

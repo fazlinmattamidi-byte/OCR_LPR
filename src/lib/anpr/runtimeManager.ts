@@ -57,8 +57,10 @@ let currentRuntimeState: ANPRRuntimeState = 'UNINITIALIZED';
 let latestBenchmarkResult: AdmissionBenchmarkResult | null = null;
 let runtimeErrorMessage: string | null = null;
 let benchmarkRunId = 0;
+let ocrInitRunId = 0;
 
 const ADMISSION_BENCHMARK_TIMEOUT_MS = 12000;
+const BACKGROUND_BENCHMARK_DELAY_MS = 3000;
 
 export function getANPRRuntimeState(): ANPRRuntimeState {
   return currentRuntimeState;
@@ -96,20 +98,11 @@ export async function initializeANPRRuntime(
       return { state: currentRuntimeState };
     }
 
-    // 2. Initialize Local PP-OCR ONNX Session
-    const ocrLoaded = await initPpOcrSession();
-    if (!ocrLoaded || !isPpOcrReady()) {
-      const { getPpOcrError } = await import('./ppOcrEngine');
-      currentRuntimeState = 'OCR_UNAVAILABLE';
-      runtimeErrorMessage = getPpOcrError() || 'Local PP-OCR ONNX model failed to load.';
-      return { state: currentRuntimeState };
-    }
-
     currentRuntimeState = 'VALIDATING_MODELS';
     const detectorProvider = getActiveDetectorProvider();
 
     currentRuntimeState = detectorProvider === 'WebGPU' ? 'READY_WEBGPU' : 'READY_WASM';
-    startBackgroundAdmissionBenchmark(benchmarkConfig, currentRuntimeState);
+    startBackgroundOcrInitAndBenchmark(benchmarkConfig, currentRuntimeState);
     return { state: currentRuntimeState };
 
   } catch (err: any) {
@@ -119,39 +112,70 @@ export async function initializeANPRRuntime(
   }
 }
 
+function startBackgroundOcrInitAndBenchmark(
+  benchmarkConfig: AdmissionBenchmarkConfig,
+  readyState: ANPRRuntimeState
+): void {
+  const runId = ++ocrInitRunId;
+
+  initPpOcrSession()
+    .then(async (ocrLoaded) => {
+      if (runId !== ocrInitRunId) return;
+
+      if (!ocrLoaded || !isPpOcrReady()) {
+        const { getPpOcrError } = await import('./ppOcrEngine');
+        currentRuntimeState = 'OCR_UNAVAILABLE';
+        runtimeErrorMessage = getPpOcrError() || 'Local PP-OCR ONNX model failed to load.';
+        return;
+      }
+
+      startBackgroundAdmissionBenchmark(benchmarkConfig, readyState);
+    })
+    .catch(async () => {
+      if (runId !== ocrInitRunId) return;
+      const { getPpOcrError } = await import('./ppOcrEngine');
+      currentRuntimeState = 'OCR_UNAVAILABLE';
+      runtimeErrorMessage = getPpOcrError() || 'Local PP-OCR ONNX model failed to load.';
+    });
+}
+
 function startBackgroundAdmissionBenchmark(
   benchmarkConfig: AdmissionBenchmarkConfig,
   readyState: ANPRRuntimeState
 ): void {
   const runId = ++benchmarkRunId;
 
-  withTimeout(
-    runAdmissionBenchmark(benchmarkConfig),
-    ADMISSION_BENCHMARK_TIMEOUT_MS,
-    'ANPR admission benchmark'
-  )
-    .then((benchmark) => {
-      if (runId !== benchmarkRunId) return;
-      latestBenchmarkResult = benchmark;
+  setTimeout(() => {
+    if (runId !== benchmarkRunId) return;
 
-      if (readyState === 'READY_WEBGPU' || benchmark.passed) {
-        if (currentRuntimeState === 'DEGRADED_PERFORMANCE') {
-          runtimeErrorMessage = null;
+    withTimeout(
+      runAdmissionBenchmark(benchmarkConfig),
+      ADMISSION_BENCHMARK_TIMEOUT_MS,
+      'ANPR admission benchmark'
+    )
+      .then((benchmark) => {
+        if (runId !== benchmarkRunId) return;
+        latestBenchmarkResult = benchmark;
+
+        if (readyState === 'READY_WEBGPU' || benchmark.passed) {
+          if (currentRuntimeState === 'DEGRADED_PERFORMANCE') {
+            runtimeErrorMessage = null;
+          }
+          currentRuntimeState = readyState;
+          return;
         }
-        currentRuntimeState = readyState;
-        return;
-      }
 
-      currentRuntimeState = 'DEGRADED_PERFORMANCE';
-      runtimeErrorMessage = benchmark.reason || 'Device performance below minimum admission threshold for live continuous scanning.';
-    })
-    .catch((err: any) => {
-      if (runId !== benchmarkRunId) return;
-      if (currentRuntimeState === 'READY_WEBGPU' || currentRuntimeState === 'READY_WASM') {
         currentRuntimeState = 'DEGRADED_PERFORMANCE';
-        runtimeErrorMessage = err?.message || 'Device benchmark timed out. Live scanning remains enabled with reduced performance diagnostics.';
-      }
-    });
+        runtimeErrorMessage = benchmark.reason || 'Device performance below minimum admission threshold for live continuous scanning.';
+      })
+      .catch((err: any) => {
+        if (runId !== benchmarkRunId) return;
+        if (currentRuntimeState === 'READY_WEBGPU' || currentRuntimeState === 'READY_WASM') {
+          currentRuntimeState = 'DEGRADED_PERFORMANCE';
+          runtimeErrorMessage = err?.message || 'Device benchmark timed out. Live scanning remains enabled with reduced performance diagnostics.';
+        }
+      });
+  }, BACKGROUND_BENCHMARK_DELAY_MS);
 }
 
 /**

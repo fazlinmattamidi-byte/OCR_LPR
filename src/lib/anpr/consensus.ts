@@ -118,7 +118,9 @@ export function addOcrVoteToTrack(
   const norm = normalizePlate(ocrText);
   if (!norm || norm.length < 2) return;
 
-  const weightedConfidence = confidence * Math.max(0.5, qualityWeight);
+  const boundedQuality = Math.min(1.0, Math.max(0.0, qualityWeight));
+  const qualityMultiplier = 0.75 + boundedQuality * 0.25;
+  const weightedConfidence = confidence * qualityMultiplier;
 
   const current = track.votes.get(norm) || { count: 0, totalConfidence: 0 };
   current.count += 1;

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { PlateTracker, BoundingBox } from '../lib/anpr/tracker';
 import { validateMalaysianPattern } from '../lib/anpr/patterns';
 
@@ -7,6 +7,10 @@ describe('FAT Tests: Tracker Scenarios and Plate Types', () => {
 
   beforeEach(() => {
     tracker = new PlateTracker(20, 8); // lostTrackTimeout = 20, max tracks = 8
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('FAT Scenario 1: Static one vehicle', () => {
@@ -182,5 +186,24 @@ describe('FAT Tests: Tracker Scenarios and Plate Types', () => {
     const duration = performance.now() - start;
     // Tracker update is O(N*M). For 5 tracks and 1000 frames, it should be highly efficient (under 50ms)
     expect(duration).toBeLessThan(100); 
+  });
+
+  it('FAT Scenario 10: active moving tracks refresh timestamp while matched', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+
+    let tracks = tracker.updateTracks([{ x: 100, y: 100, width: 90, height: 30, confidence: 0.9 }]);
+    const trackId = tracks[0].trackId;
+    expect(tracker.getTrack(trackId)?.lastSeenTimestamp).toBe(1000);
+
+    vi.setSystemTime(2600);
+    tracks = tracker.updateTracks([{ x: 118, y: 104, width: 90, height: 30, confidence: 0.9 }]);
+    expect(tracks[0].trackId).toBe(trackId);
+    expect(tracker.getTrack(trackId)?.lastSeenTimestamp).toBe(2600);
+
+    vi.setSystemTime(4200);
+    tracks = tracker.updateTracks([{ x: 135, y: 108, width: 90, height: 30, confidence: 0.8 }]);
+    expect(tracks[0].trackId).toBe(trackId);
+    expect(tracker.getTrack(trackId)?.lastSeenTimestamp).toBe(4200);
   });
 });

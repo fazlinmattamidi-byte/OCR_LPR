@@ -28,7 +28,7 @@ import {
 } from '@/lib/anpr/yoloDetector';
 import {
   generateAdaptiveCrops,
-  cropCanvasRegion,
+  cropCanvasRegionFast,
   prioritiseTracks,
 } from '@/lib/anpr/imageProcessor';
 import { globalBestFrameSelector } from '@/lib/anpr/bestFrameSelector';
@@ -46,7 +46,7 @@ import {
   ANPRRuntimeState,
   AdmissionBenchmarkResult,
 } from '@/lib/anpr/runtimeManager';
-import { getActivePpOcrProvider, ActiveOcrProvider } from '@/lib/anpr/ppOcrEngine';
+import { getActivePpOcrProvider, isPpOcrReady, ActiveOcrProvider } from '@/lib/anpr/ppOcrEngine';
 
 interface MatchEntry {
   type: 'EXACT' | 'POSSIBLE';
@@ -86,6 +86,16 @@ function getTrackStatusLabel(track: ActiveTrack): string {
 function isRuntimeScanningReady(state: ANPRRuntimeState): boolean {
   return state === 'READY_WEBGPU' || state === 'READY_WASM' || state === 'DEGRADED_PERFORMANCE';
 }
+
+const DETECTION_TARGET_INTERVAL_MS = 90;
+const DETECTION_BUSY_INTERVAL_MS = 125;
+const DETECTION_MIN_DELAY_MS = 16;
+const DETECTOR_VALIDATION_INTERVAL_MS = 2000;
+const CROP_SAMPLE_FAST_MS = 90;
+const CROP_SAMPLE_NORMAL_MS = 160;
+const OCR_FIRST_READ_RETRY_MS = 120;
+const OCR_REPEAT_READ_RETRY_MS = 260;
+const OCR_MAX_CONCURRENCY = 4;
 
 function getCameraPreflightError(): string | null {
   if (typeof window === 'undefined') return null;
@@ -341,6 +351,7 @@ export default function ScannerPage() {
           settingsRef.current = { ...settingsRef.current, ...data.settings };
           setIsDebugMode(!!data.settings.debugMode);
           trackerRef.current.setLostTrackTimeout(data.settings.lostTrackTimeout ?? 20);
+          trackerRef.current.setMaxActiveTracks(data.settings.maxTracks ?? INITIAL_SETTINGS.maxTracks);
         }
       })
       .catch(() => {});
@@ -445,13 +456,21 @@ export default function ScannerPage() {
   };
 
   // ─── 6. Per-Track Database Match ─────────────────────────────────────────
-  const runDatabaseMatch = useCallback(async (track: ActiveTrack, plate: string, confidence: number) => {
+  const runDatabaseMatch = useCallback(async (
+    track: ActiveTrack,
+    plate: string,
+    confidence: number,
+    options: { commitNoCase?: boolean } = {}
+  ) => {
+    const commitNoCase = options.commitNoCase ?? true;
     const cooldownMs = settingsRef.current.duplicateCooldown * 1000;
     const now = Date.now();
     const lastSearch = cooldownMap.current.get(plate) ?? 0;
+    const trackSearchThrottleMs = commitNoCase ? cooldownMs : 1500;
 
-    if (now - lastSearch < cooldownMs) return;
-    cooldownMap.current.set(plate, now);
+    if (commitNoCase && now - lastSearch < cooldownMs) return;
+    if (track.lastSearchedAt && now - track.lastSearchedAt < trackSearchThrottleMs) return;
+    track.lastSearchedAt = now;
 
     track.ocrState = 'DB_CHECKING';
 
@@ -463,6 +482,13 @@ export default function ScannerPage() {
       }).then(r => r.json());
 
       if (!searchRes.success) return;
+
+      if (!commitNoCase && searchRes.matchType !== 'EXACT' && searchRes.matchType !== 'POSSIBLE') {
+        track.ocrState = 'CONSENSUS_BUILDING';
+        return;
+      }
+
+      cooldownMap.current.set(plate, now);
 
       const scanRes = await fetch('/api/scans', {
         method: 'POST',
@@ -537,6 +563,7 @@ export default function ScannerPage() {
     let detTs = Date.now();
     let detCount = 0;
     let lastVideoTime = -1;
+    let lastDetectorValidationAt = 0;
 
     const scheduleDetection = (delay = 100) => {
       if (stopped) return;
@@ -579,24 +606,34 @@ export default function ScannerPage() {
         return;
       }
 
+      const detectionStartedAt = performance.now();
       processingCtx.drawImage(video, 0, 0, processingCanvas.width, processingCanvas.height);
 
       const s = settingsRef.current;
 
       // ── Step 1: Malaysian Plate Detector ──
-      const detectedPlates = await detectMalaysianPlates(processingCanvas, {
-        minConfidence: s.detectionThreshold,
-        enginePreference: s.detectorEngine,
-        developerMode: s.debugMode,
-      });
+      let detectedPlates: Awaited<ReturnType<typeof detectMalaysianPlates>> = [];
+      try {
+        detectedPlates = await detectMalaysianPlates(processingCanvas, {
+          minConfidence: s.detectionThreshold,
+          enginePreference: s.detectorEngine,
+          developerMode: s.debugMode,
+        });
+      } catch (err) {
+        console.warn('[Scanner] Detector frame failed:', err);
+      }
 
       if (detectedPlates.length > 0) {
         setActiveEngine(detectedPlates[0].sourceEngine);
         const avgConf = detectedPlates.reduce((sum, p) => sum + p.confidence, 0) / detectedPlates.length;
         setAvgConfidence(avgConf);
       } else {
-        const val = await validateDetector();
-        if (val.valid) setActiveEngine('LOCAL_ONNX');
+        const now = Date.now();
+        if (now - lastDetectorValidationAt > DETECTOR_VALIDATION_INTERVAL_MS) {
+          lastDetectorValidationAt = now;
+          const val = await validateDetector();
+          if (val.valid) setActiveEngine('LOCAL_ONNX');
+        }
       }
 
       const bboxList = detectedPlates.map(p => ({
@@ -617,10 +654,18 @@ export default function ScannerPage() {
       setTracksList([...displayTracks]); // UI List
 
       // ── Step 3: Best Frame Selection (Only on Confirmed Tracks) ──
+      const cropSampleNow = Date.now();
       confirmedTracks.forEach(track => {
         if (track.ocrState === 'COOLDOWN' || track.ocrState === 'MATCHED') return;
-        const cropCanvas = cropCanvasRegion(processingCanvas, track.bbox);
+        const existingCrop = globalBestFrameSelector.getBestCrop(track.trackNumber);
+        const sampleInterval = track.bbox.confidence >= 0.70 ? CROP_SAMPLE_FAST_MS : CROP_SAMPLE_NORMAL_MS;
+        if (existingCrop && track.lastCropSampledAt && cropSampleNow - track.lastCropSampledAt < sampleInterval) {
+          return;
+        }
+
+        const cropCanvas = cropCanvasRegionFast(processingCanvas, track.bbox);
         globalBestFrameSelector.addCropCandidate(track.trackNumber, cropCanvas, track.bbox);
+        track.lastCropSampledAt = cropSampleNow;
       });
 
       // ── Step 4: OCR Priority Queue (Async Decoupled) ──
@@ -634,37 +679,59 @@ export default function ScannerPage() {
         detTs = now;
       }
 
-      // Adaptive FPS: If OCR is busy, reduce detector FPS to save memory/battery
-      const nextDelay = activeOcrCount.current > 0 ? 166 : 100; // ~6 FPS if busy, 10 FPS if idle
+      const targetInterval = activeOcrCount.current > 0 ? DETECTION_BUSY_INTERVAL_MS : DETECTION_TARGET_INTERVAL_MS;
+      const nextDelay = Math.max(DETECTION_MIN_DELAY_MS, Math.round(targetInterval - (performance.now() - detectionStartedAt)));
       scheduleDetection(nextDelay);
     };
 
     const processOcrQueue = async (confirmedTracks: ActiveTrack[], canvas: HTMLCanvasElement, s: ScannerSettings) => {
+      if (!isPpOcrReady()) {
+        confirmedTracks.forEach(track => {
+          if (!track.cooldownActive && track.ocrState !== 'MATCHED') {
+            track.ocrState = 'COLLECTING';
+          }
+        });
+        return;
+      }
+
+      const maxOcrConcurrency = Math.min(
+        OCR_MAX_CONCURRENCY,
+        Math.max(1, s.maxOcrConcurrency || INITIAL_SETTINGS.maxOcrConcurrency)
+      );
       const priorityIds = prioritiseTracks(
-        confirmedTracks.map(t => ({ trackId: t.trackId, bbox: t.bbox, framesSeen: t.framesSeen, ocrState: t.ocrState })),
+        confirmedTracks.map(t => ({
+          trackId: t.trackId,
+          bbox: t.bbox,
+          framesSeen: t.framesSeen,
+          ocrState: t.ocrState,
+          lastOcrAttemptAt: t.lastOcrAttemptAt,
+          voteCount: Array.from(t.votes.values()).reduce((sum, vote) => sum + vote.count, 0),
+        })),
         canvas.width,
         canvas.height,
-        s.maxOcrConcurrency
+        maxOcrConcurrency
       );
 
       for (const trackId of priorityIds) {
         const track = trackerRef.current.getTrack(trackId);
         if (!track || !track.isConfirmed || track.ocrRunning || track.cooldownActive) continue;
-        if (activeOcrCount.current >= s.maxOcrConcurrency) break;
+        if (activeOcrCount.current >= maxOcrConcurrency) break;
 
-        // OCR Gating: Need at least 2 frames and plate wide enough to read
-        // 60px is the practical minimum for PP-OCR to extract characters on mobile.
-        if (track.framesSeen < 2 || track.bbox.width < 60) {
+        const now = Date.now();
+        const voteCount = Array.from(track.votes.values()).reduce((sum, vote) => sum + vote.count, 0);
+        const retryDelay = voteCount === 0 ? OCR_FIRST_READ_RETRY_MS : OCR_REPEAT_READ_RETRY_MS;
+        if (track.lastOcrAttemptAt && now - track.lastOcrAttemptAt < retryDelay) continue;
+
+        const minReadableWidth = Math.max(40, s.minCropWidth || INITIAL_SETTINGS.minCropWidth);
+        const canReadFirstFrame = track.framesSeen >= 2 || track.bbox.confidence >= 0.60;
+        if (!canReadFirstFrame || track.bbox.width < minReadableWidth) {
           track.ocrState = 'COLLECTING';
           continue;
         }
 
         const bestFrameEntry = globalBestFrameSelector.getBestCrop(track.trackNumber);
-        const targetCrop = bestFrameEntry ? bestFrameEntry.canvas : null;
-        
-        if (!targetCrop) continue; // Skip if no crop saved yet
-        
-        const qualityReport = bestFrameEntry?.quality || { overallScore: 0.6, recommendation: 'PASS' };
+        const targetCrop = bestFrameEntry?.canvas ?? cropCanvasRegionFast(canvas, track.bbox);
+        const qualityReport = bestFrameEntry?.quality || { overallScore: 0.6, recommendation: 'MARGINAL' as const };
         // Only skip truly unusable frames — MARGINAL frames go through to OCR.
         // The best-frame selector has already picked the sharpest available crop.
         if (qualityReport.recommendation === 'REJECT') {
@@ -673,20 +740,21 @@ export default function ScannerPage() {
         }
 
         track.ocrRunning = true;
+        track.ocrJobQueued = true;
+        track.lastOcrAttemptAt = now;
         track.ocrState = 'OCR_RUNNING';
         activeOcrCount.current++;
 
         (async () => {
           try {
-            // Memory optimization: generate Adaptive Crops only when needed
-            const adaptiveCrops = generateAdaptiveCrops(targetCrop, {x:0, y:0, width: targetCrop.width, height: targetCrop.height, confidence: 1.0});
-            const preferredVariants = ['ORIGINAL', 'SHARPEN', 'DARK_BG'] as const;
-            const preferredCrops = preferredVariants
-              .map(variant => adaptiveCrops.find(c => c.variant === variant))
-              .filter((crop): crop is (typeof adaptiveCrops)[number] => Boolean(crop));
-            const candidateCrops = [...preferredCrops, ...adaptiveCrops]
-              .filter((crop, index, list) => crop && list.findIndex(item => item?.canvas === crop.canvas) === index)
-              .slice(0, 4);
+            const adaptiveCrops = generateAdaptiveCrops(
+              targetCrop,
+              { x: 0, y: 0, width: targetCrop.width, height: targetCrop.height, confidence: 1.0 },
+              360,
+              108,
+              ['ORIGINAL', 'SHARPEN', 'DARK_BG', 'INVERTED']
+            );
+            const candidateCrops = adaptiveCrops.slice(0, 4);
             const fallbackCrop = {
               canvas: targetCrop,
               isTwoLine: targetCrop.width / Math.max(1, targetCrop.height) < 2.3,
@@ -721,11 +789,22 @@ export default function ScannerPage() {
               addOcrVoteToTrack(updatedTrack, text, conf, qualityReport.overallScore);
               updatedTrack.ocrState = 'CONSENSUS_BUILDING';
 
-              const consensus = evaluateConsensus(updatedTrack, s.consensusVotes, s.recognitionThreshold);
+              const veryStrongRead = conf >= Math.max(0.62, s.recognitionThreshold) && bestScore >= 0.78;
+              const strongRead = conf >= 0.35 && bestScore >= 0.68;
+              const requiredVotes = veryStrongRead ? 1 : strongRead ? Math.min(2, s.consensusVotes) : s.consensusVotes;
+              const confidenceGate = veryStrongRead
+                ? Math.min(s.recognitionThreshold, 0.58)
+                : strongRead
+                  ? Math.min(s.recognitionThreshold, 0.45)
+                  : s.recognitionThreshold;
+              const consensus = evaluateConsensus(updatedTrack, requiredVotes, confidenceGate);
               if (consensus.isStabilized) {
+                const matchConfidence = Math.max(consensus.confidence, Math.min(0.98, bestScore));
                 updatedTrack.stabilizedPlate = consensus.normalizedPlate;
-                updatedTrack.stabilizedConfidence = consensus.confidence;
-                await runDatabaseMatch(updatedTrack, consensus.normalizedPlate, consensus.confidence);
+                updatedTrack.stabilizedConfidence = matchConfidence;
+                await runDatabaseMatch(updatedTrack, consensus.normalizedPlate, matchConfidence, {
+                  commitNoCase: !veryStrongRead,
+                });
               }
             } else {
               if (updatedTrack.votes.size === 0) updatedTrack.ocrState = 'COLLECTING';
@@ -734,7 +813,11 @@ export default function ScannerPage() {
             console.warn('[OCR] Error:', e);
           } finally {
             const t = trackerRef.current.getTrack(trackId);
-            if (t) t.ocrRunning = false;
+            if (t) {
+              t.ocrRunning = false;
+              t.ocrJobQueued = false;
+              t.lastOcrCompletedAt = Date.now();
+            }
             activeOcrCount.current = Math.max(0, activeOcrCount.current - 1);
           }
         })();
