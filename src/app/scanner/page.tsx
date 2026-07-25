@@ -123,6 +123,8 @@ const SCANNER_MAINTENANCE_INTERVAL_MS = 1000;
 const COOLDOWN_MAP_MAX_ENTRIES = 120;
 const MATCH_ALERT_LIMIT = 6;
 const TRACK_RESULT_HOLD_MS = 900;
+const POSSIBLE_MATCH_CONFIRMATION_READS = 2;
+const POSSIBLE_MATCH_CONFIRMATION_WINDOW_MS = 900;
 
 function getExpectedMinPlateChars(crop: HTMLCanvasElement): number {
   const aspect = crop.width / Math.max(1, crop.height);
@@ -174,7 +176,35 @@ function resetTrackForNextPlate(track: ActiveTrack): void {
   delete track.matchType;
   delete track.matchedVehicle;
   delete track.possibleMatchVehicles;
+  delete track.possibleVerificationPlate;
+  delete track.possibleVerificationCount;
+  delete track.possibleVerificationStartedAt;
   delete track.scanEventId;
+}
+
+function prepareSilentPossibleConfirmation(track: ActiveTrack, plate: string, now: number): void {
+  const windowActive =
+    !!track.possibleVerificationStartedAt &&
+    now - track.possibleVerificationStartedAt <= POSSIBLE_MATCH_CONFIRMATION_WINDOW_MS;
+
+  track.possibleVerificationPlate = plate;
+  track.possibleVerificationCount = windowActive ? (track.possibleVerificationCount ?? 0) + 1 : 1;
+  track.possibleVerificationStartedAt = windowActive ? track.possibleVerificationStartedAt ?? now : now;
+
+  track.ocrState = 'COLLECTING';
+  track.cooldownActive = false;
+  track.votes.clear();
+  track.cropSamples = [];
+
+  delete track.cooldownStartedAt;
+  delete track.lastCropSampledAt;
+  delete track.lastOcrAttemptAt;
+  delete track.lastOcrCompletedAt;
+  delete track.stabilizedPlate;
+  delete track.stabilizedConfidence;
+  delete track.matchType;
+  delete track.matchedVehicle;
+  delete track.possibleMatchVehicles;
 }
 
 function drawRoundedRect(
@@ -743,12 +773,23 @@ export default function ScannerPage() {
         return;
       }
 
-      cooldownMap.current.set(plate, now);
+      const possibleWindowActive =
+        !!track.possibleVerificationStartedAt &&
+        now - track.possibleVerificationStartedAt <= POSSIBLE_MATCH_CONFIRMATION_WINDOW_MS;
+      const possibleReadCount = possibleWindowActive ? track.possibleVerificationCount ?? 0 : 0;
+
+      if (searchRes.matchType === 'POSSIBLE' && possibleReadCount < POSSIBLE_MATCH_CONFIRMATION_READS - 1) {
+        prepareSilentPossibleConfirmation(track, plate, now);
+        globalBestFrameSelector.clearTrack(track.trackNumber);
+        track.lastSearchedAt = 0;
+        return;
+      }
+
       const resolvedMatchType = searchRes.matchType === 'EXACT'
         ? 'EXACT'
-        : searchRes.matchType === 'POSSIBLE'
-          ? 'POSSIBLE'
-          : 'NONE';
+        : 'NONE';
+
+      cooldownMap.current.set(plate, now);
 
       const scanRes = await fetch('/api/scans', {
         method: 'POST',
@@ -758,7 +799,7 @@ export default function ScannerPage() {
           normalizedPlate: plate,
           confidence,
           matchType: resolvedMatchType,
-          matchedVehicleId: searchRes.matchedVehicle?.id ?? undefined,
+          matchedVehicleId: resolvedMatchType === 'EXACT' ? searchRes.matchedVehicle?.id ?? undefined : undefined,
           source: 'CAMERA',
           trackId: track.trackId,
           frameCount: track.framesSeen,
@@ -767,9 +808,12 @@ export default function ScannerPage() {
       }).then(r => r.json());
 
       track.matchType = resolvedMatchType;
-      track.matchedVehicle = searchRes.matchedVehicle ?? undefined;
-      track.possibleMatchVehicles = searchRes.possibleMatches ?? [];
-      track.ocrState = track.matchType === 'EXACT' ? 'MATCHED' : track.matchType === 'POSSIBLE' ? 'POSSIBLE MATCH' : 'NO CASE';
+      track.matchedVehicle = resolvedMatchType === 'EXACT' ? searchRes.matchedVehicle ?? undefined : undefined;
+      track.possibleMatchVehicles = [];
+      track.ocrState = track.matchType === 'EXACT' ? 'MATCHED' : 'NO CASE';
+      delete track.possibleVerificationPlate;
+      delete track.possibleVerificationCount;
+      delete track.possibleVerificationStartedAt;
 
       if (resolvedMatchType === 'EXACT') {
         if (settingsRef.current.soundEnabled) playAlertSound('EXACT_MATCH');
@@ -781,21 +825,6 @@ export default function ScannerPage() {
           trackId: track.trackId,
           vehicle: searchRes.matchedVehicle,
           possibleMatches: [],
-          confidence,
-          scanId: scanRes.scanEvent?.id,
-          timestamp: now,
-          dismissed: false,
-        };
-        setMatchQueue(q => enqueueMatchEntry(q, entry));
-
-      } else if (resolvedMatchType === 'POSSIBLE') {
-        if (settingsRef.current.soundEnabled) playAlertSound('POSSIBLE_MATCH');
-        const entry: MatchEntry = {
-          type: 'POSSIBLE',
-          plate,
-          trackId: track.trackId,
-          vehicle: null,
-          possibleMatches: searchRes.possibleMatches ?? [],
           confidence,
           scanId: scanRes.scanEvent?.id,
           timestamp: now,

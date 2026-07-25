@@ -48,6 +48,10 @@ export interface ActiveTrack {
   matchedVehicle?: any;
   possibleMatchVehicles?: any[];
 
+  possibleVerificationPlate?: string;
+  possibleVerificationCount?: number;
+  possibleVerificationStartedAt?: number;
+
   cooldownActive: boolean;
   cooldownStartedAt?: number;
   lastSearchedAt?: number;
