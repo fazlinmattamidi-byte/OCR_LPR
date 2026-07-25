@@ -22,10 +22,8 @@ import Link from 'next/link';
 import { PlateTracker, ActiveTrack } from '@/lib/anpr/tracker';
 import {
   detectMalaysianPlates,
-  initLocalOnnxSession,
   validateDetector,
   getActiveDetectorProvider,
-  DetectedPlateBox,
   ActiveExecutionProvider,
 } from '@/lib/anpr/yoloDetector';
 import {
@@ -48,7 +46,7 @@ import {
   ANPRRuntimeState,
   AdmissionBenchmarkResult,
 } from '@/lib/anpr/runtimeManager';
-import { initPpOcrSession, getActivePpOcrProvider, ActiveOcrProvider } from '@/lib/anpr/ppOcrEngine';
+import { getActivePpOcrProvider, ActiveOcrProvider } from '@/lib/anpr/ppOcrEngine';
 
 interface MatchEntry {
   type: 'EXACT' | 'POSSIBLE';
@@ -83,6 +81,10 @@ function getTrackStatusLabel(track: ActiveTrack): string {
     case 'COOLDOWN': return 'COOLDOWN';
     default: return 'SCANNING';
   }
+}
+
+function isRuntimeScanningReady(state: ANPRRuntimeState): boolean {
+  return state === 'READY_WEBGPU' || state === 'READY_WASM' || state === 'DEGRADED_PERFORMANCE';
 }
 
 function getCameraPreflightError(): string | null {
@@ -236,8 +238,10 @@ function getCameraErrorMessage(err: any): string {
 export default function ScannerPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const processingCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const trackerRef = useRef<PlateTracker>(new PlateTracker(20, 8));
   const streamRef = useRef<MediaStream | null>(null);
+  const runtimeStateRef = useRef<ANPRRuntimeState>('UNINITIALIZED');
 
   // Camera state
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -299,15 +303,34 @@ export default function ScannerPage() {
     setDetFps(0);
   }, []);
 
-  const startRuntimeInit = useCallback(async () => {
-    setRuntimeState('LOADING_MODELS');
-    const res = await initializeANPRRuntime();
-    setRuntimeState(res.state);
-    if (res.benchmark) setBenchmarkResult(res.benchmark);
+  const syncRuntimeStatus = useCallback(() => {
+    const nextState = getANPRRuntimeState();
+    runtimeStateRef.current = nextState;
+    setRuntimeState(prev => prev === nextState ? prev : nextState);
+
+    const nextBenchmark = getLatestBenchmarkResult();
+    setBenchmarkResult(prev => prev === nextBenchmark ? prev : nextBenchmark);
     setRuntimeErrorMessage(getRuntimeErrorMessage());
     setDetectorProvider(getActiveDetectorProvider());
     setOcrProvider(getActivePpOcrProvider());
   }, []);
+
+  const startRuntimeInit = useCallback(async () => {
+    runtimeStateRef.current = 'LOADING_MODELS';
+    setRuntimeState('LOADING_MODELS');
+    setRuntimeErrorMessage(null);
+
+    const progressTimer = window.setInterval(syncRuntimeStatus, 500);
+    try {
+      const res = await initializeANPRRuntime();
+      runtimeStateRef.current = res.state;
+      setRuntimeState(res.state);
+      if (res.benchmark) setBenchmarkResult(res.benchmark);
+    } finally {
+      window.clearInterval(progressTimer);
+      syncRuntimeStatus();
+    }
+  }, [syncRuntimeStatus]);
 
   // ─── 1. Load Settings & Initialize Runtime ───────────────────────────
   useEffect(() => {
@@ -324,6 +347,11 @@ export default function ScannerPage() {
 
     startRuntimeInit();
   }, [startRuntimeInit]);
+
+  useEffect(() => {
+    const id = window.setInterval(syncRuntimeStatus, 1000);
+    return () => window.clearInterval(id);
+  }, [syncRuntimeStatus]);
 
   // ─── 2. Initialise Camera ────────────────────────────────────────────────
   const initCamera = useCallback(async (deviceId?: string) => {
@@ -504,32 +532,59 @@ export default function ScannerPage() {
     if (!cameraReady) return;
 
     let animId: number;
-    let detectionTimeout: NodeJS.Timeout;
+    let detectionTimeout: ReturnType<typeof setTimeout> | undefined;
+    let stopped = false;
     let detTs = Date.now();
     let detCount = 0;
+    let lastVideoTime = -1;
+
+    const scheduleDetection = (delay = 100) => {
+      if (stopped) return;
+      detectionTimeout = setTimeout(runDetection, delay);
+    };
 
     const runDetection = async () => {
-      if (!videoRef.current || !canvasRef.current || isPausedRef.current) return;
+      if (stopped) return;
 
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-
-      if (video.readyState < 2 || video.videoWidth === 0) return;
-
-      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+      if (!videoRef.current) {
+        scheduleDetection(150);
+        return;
       }
 
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx) return;
+      if (isPausedRef.current || !isRuntimeScanningReady(runtimeStateRef.current)) {
+        scheduleDetection(250);
+        return;
+      }
 
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const video = videoRef.current;
+
+      if (video.readyState < 2 || video.videoWidth === 0) {
+        scheduleDetection(150);
+        return;
+      }
+
+      if (!processingCanvasRef.current) {
+        processingCanvasRef.current = document.createElement('canvas');
+      }
+
+      const processingCanvas = processingCanvasRef.current;
+      if (processingCanvas.width !== video.videoWidth || processingCanvas.height !== video.videoHeight) {
+        processingCanvas.width = video.videoWidth;
+        processingCanvas.height = video.videoHeight;
+      }
+
+      const processingCtx = processingCanvas.getContext('2d', { willReadFrequently: true });
+      if (!processingCtx) {
+        scheduleDetection(150);
+        return;
+      }
+
+      processingCtx.drawImage(video, 0, 0, processingCanvas.width, processingCanvas.height);
 
       const s = settingsRef.current;
 
       // ── Step 1: Malaysian Plate Detector ──
-      const detectedPlates = await detectMalaysianPlates(canvas, {
+      const detectedPlates = await detectMalaysianPlates(processingCanvas, {
         minConfidence: s.detectionThreshold,
         enginePreference: s.detectorEngine,
         developerMode: s.debugMode,
@@ -564,15 +619,12 @@ export default function ScannerPage() {
       // ── Step 3: Best Frame Selection (Only on Confirmed Tracks) ──
       confirmedTracks.forEach(track => {
         if (track.ocrState === 'COOLDOWN' || track.ocrState === 'MATCHED') return;
-        const cropCanvas = cropCanvasRegion(canvas, track.bbox);
+        const cropCanvas = cropCanvasRegion(processingCanvas, track.bbox);
         globalBestFrameSelector.addCropCandidate(track.trackNumber, cropCanvas, track.bbox);
       });
 
-      // ── Step 4: Draw Overlays ──
-      drawOverlays(ctx, canvas.width, canvas.height, displayTracks, s.showCenterGuide, s.debugMode);
-
-      // ── Step 5: OCR Priority Queue (Async Decoupled) ──
-      processOcrQueue(confirmedTracks, canvas, s);
+      // ── Step 4: OCR Priority Queue (Async Decoupled) ──
+      processOcrQueue(confirmedTracks, processingCanvas, s);
 
       detCount++;
       const now = Date.now();
@@ -584,7 +636,7 @@ export default function ScannerPage() {
 
       // Adaptive FPS: If OCR is busy, reduce detector FPS to save memory/battery
       const nextDelay = activeOcrCount.current > 0 ? 166 : 100; // ~6 FPS if busy, 10 FPS if idle
-      detectionTimeout = setTimeout(runDetection, nextDelay);
+      scheduleDetection(nextDelay);
     };
 
     const processOcrQueue = async (confirmedTracks: ActiveTrack[], canvas: HTMLCanvasElement, s: ScannerSettings) => {
@@ -691,7 +743,31 @@ export default function ScannerPage() {
 
     const renderLoop = () => {
       if (!isPausedRef.current) {
-        camFrameCount.current++;
+        const video = videoRef.current;
+        const overlayCanvas = canvasRef.current;
+
+        if (video && overlayCanvas && video.readyState >= 2 && video.videoWidth > 0) {
+          if (overlayCanvas.width !== video.videoWidth || overlayCanvas.height !== video.videoHeight) {
+            overlayCanvas.width = video.videoWidth;
+            overlayCanvas.height = video.videoHeight;
+          }
+
+          const overlayCtx = overlayCanvas.getContext('2d');
+          if (overlayCtx) {
+            overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            const s = settingsRef.current;
+            const displayTracks = s.debugMode
+              ? trackerRef.current.getActiveTracks(false)
+              : trackerRef.current.getActiveTracks(true);
+            drawOverlays(overlayCtx, overlayCanvas.width, overlayCanvas.height, displayTracks, s.showCenterGuide, s.debugMode);
+          }
+
+          if (video.currentTime !== lastVideoTime) {
+            camFrameCount.current++;
+            lastVideoTime = video.currentTime;
+          }
+        }
+
         const now = Date.now();
         if (now - lastFpsTs.current >= 1000) {
           setCamFps(camFrameCount.current);
@@ -703,11 +779,12 @@ export default function ScannerPage() {
     };
 
     animId = requestAnimationFrame(renderLoop);
-    detectionTimeout = setTimeout(runDetection, 100);
+    scheduleDetection(100);
 
     return () => {
+      stopped = true;
       cancelAnimationFrame(animId);
-      clearTimeout(detectionTimeout);
+      if (detectionTimeout) clearTimeout(detectionTimeout);
     };
   }, [cameraReady, runDatabaseMatch]);
 
@@ -800,10 +877,13 @@ export default function ScannerPage() {
   const isReadingPlate = cameraReady && !cameraError && tracksList.some(
     t => ['COLLECTING', 'OCR_RUNNING', 'OCR RUNNING', 'CONSENSUS_BUILDING', 'CONSENSUS', 'DB_CHECKING', 'DATABASE CHECK'].includes(t.ocrState)
   );
+  const runtimeReady = isRuntimeScanningReady(runtimeState);
   const bottomStatus = cameraError
     ? { label: 'CAMERA UNAVAILABLE', dotClass: 'bg-rose-500', textClass: 'text-rose-400' }
     : !cameraReady
       ? { label: 'STARTING CAMERA', dotClass: 'bg-slate-500 animate-pulse', textClass: 'text-slate-400' }
+      : !runtimeReady
+        ? { label: 'AI WARMING UP', dotClass: 'bg-[#00d8f6] animate-pulse', textClass: 'text-[#00d8f6]' }
       : isPaused
         ? { label: 'SCANNER PAUSED', dotClass: 'bg-slate-500', textClass: 'text-slate-400' }
         : isReadingPlate
@@ -929,7 +1009,7 @@ export default function ScannerPage() {
         })()}
 
         {/* BOTTOM SCANNING STATUS PILL */}
-        {cameraReady && !cameraError && (
+        {cameraReady && !cameraError && runtimeReady && (
           <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 transition-all duration-300 pointer-events-none">
             {(() => {
               if (isReadingPlate) {
@@ -977,12 +1057,12 @@ export default function ScannerPage() {
           playsInline
           muted
           className="absolute inset-0 w-full h-full object-cover"
-          style={{ opacity: 0 }}
+          style={{ display: cameraReady && !cameraError ? 'block' : 'none' }}
         />
 
         <canvas
           ref={canvasRef}
-          className="absolute inset-0 w-full h-full object-cover"
+          className="absolute inset-0 w-full h-full object-cover pointer-events-none"
           style={{ display: cameraReady ? 'block' : 'none' }}
         />
 

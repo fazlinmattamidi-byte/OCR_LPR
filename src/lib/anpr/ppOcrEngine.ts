@@ -11,7 +11,13 @@
 import { CharacterConfidence, PlateCategory, PlateLayout } from '../db/types';
 import { normalizePlate, formatDisplayPlate, generateCandidatePlates } from './normaliser';
 import { validateMalaysianPattern } from './patterns';
-import { configureOrtWasm, getOrt } from './onnxRuntime';
+import {
+  canUseWebGpuExecutionProvider,
+  configureOrtWasm,
+  fetchWithTimeout,
+  getOrt,
+  withTimeout,
+} from './onnxRuntime';
 
 export interface PpOcrRecognitionResult {
   text: string;
@@ -32,8 +38,12 @@ export type ActiveOcrProvider = 'WebGPU' | 'WASM' | 'NONE';
 let ppOcrSession: any = null;
 let dictLines: string[] = [];
 let isSessionLoading = false;
+let sessionLoadPromise: Promise<boolean> | null = null;
 let sessionLoadFailures = 0;
 const MAX_SESSION_FAILURES = 3;
+const MODEL_FETCH_TIMEOUT_MS = 20000;
+const PROVIDER_INIT_TIMEOUT_MS = 15000;
+const PROVIDER_WARMUP_TIMEOUT_MS = 8000;
 
 let activeOcrProvider: ActiveOcrProvider = 'NONE';
 let reusableOcrCanvas: HTMLCanvasElement | null = null;
@@ -57,81 +67,102 @@ export async function initPpOcrSession(): Promise<boolean> {
   if (typeof window === 'undefined') return false;
   if (ppOcrSession) return true;
   if (sessionLoadFailures >= MAX_SESSION_FAILURES) return false;
-  if (isSessionLoading) return false;
+  if (isSessionLoading && sessionLoadPromise) return sessionLoadPromise;
 
   isSessionLoading = true;
   lastPpOcrError = null;
 
-  try {
-    // 1. Fetch character dictionary
-    const dictRes = await fetch('/models/ppocr-dict.txt');
-    if (!dictRes.ok) {
-      console.warn('[PP-OCR] Dictionary /models/ppocr-dict.txt not found.');
+  sessionLoadPromise = (async () => {
+    try {
+      // 1. Fetch character dictionary
+      const dictRes = await fetchWithTimeout(
+        '/models/ppocr-dict.txt',
+        MODEL_FETCH_TIMEOUT_MS,
+        'PP-OCR dictionary fetch'
+      );
+      if (!dictRes.ok) {
+        console.warn('[PP-OCR] Dictionary /models/ppocr-dict.txt not found.');
+        sessionLoadFailures++;
+        return false;
+      }
+      const dictText = await dictRes.text();
+      dictLines = dictText.split(/\r?\n/).map(l => l.trim());
+      dictLines.push(' '); // Append space character at index dictLines.length
+
+      // 2. Load ONNX Runtime Web
+      const ort = await getOrt();
+      const webGpuAvailable = canUseWebGpuExecutionProvider();
+      configureOrtWasm(ort, webGpuAvailable);
+
+      const modelRes = await fetchWithTimeout(
+        '/models/ppocr-rec.onnx',
+        MODEL_FETCH_TIMEOUT_MS,
+        'PP-OCR recognition model fetch'
+      );
+      if (!modelRes.ok) {
+        throw new Error(`HTTP ${modelRes.status} ${modelRes.statusText} fetching /models/ppocr-rec.onnx`);
+      }
+      const modelBuffer = await modelRes.arrayBuffer();
+      const modelBytes = new Uint8Array(modelBuffer);
+
+      let lastErrDetail = '';
+      const configsToTry = [
+        ...(webGpuAvailable ? [{ epList: ['webgpu', 'wasm'], opt: 'all', name: 'WebGPU' as ActiveOcrProvider }] : []),
+        { epList: ['wasm'], opt: 'all', name: 'WASM' as ActiveOcrProvider },
+        { epList: ['wasm'], opt: 'basic', name: 'WASM' as ActiveOcrProvider },
+      ];
+
+      for (const config of configsToTry) {
+        try {
+          configureOrtWasm(ort, config.name === 'WebGPU');
+          const session = await withTimeout<any>(
+            ort.InferenceSession.create(modelBytes, {
+              executionProviders: config.epList,
+              graphOptimizationLevel: config.opt as any,
+            }),
+            PROVIDER_INIT_TIMEOUT_MS,
+            `PP-OCR ${config.name} session creation`
+          );
+
+          // Dummy inference validation
+          const dummyInput = new ort.Tensor('float32', new Float32Array(1 * 3 * 48 * 320), [1, 3, 48, 320]);
+          const inputName = session.inputNames[0] || 'x';
+          const dummyResults = await withTimeout<Record<string, any>>(
+            session.run({ [inputName]: dummyInput }),
+            PROVIDER_WARMUP_TIMEOUT_MS,
+            `PP-OCR ${config.name} warm-up`
+          );
+
+          dummyInput.dispose?.();
+          for (const t of Object.values(dummyResults)) {
+            (t as any)?.dispose?.();
+          }
+
+          ppOcrSession = session;
+          activeOcrProvider = config.name;
+          sessionLoadFailures = 0;
+          console.log(`[PP-OCR] ONNX Session initialized successfully with provider: ${config.name} (opt: ${config.opt})`);
+          return true;
+        } catch (err: any) {
+          lastErrDetail = err?.message || String(err);
+          console.warn(`[PP-OCR] Provider ${config.name} (opt: ${config.opt}) failed:`, lastErrDetail);
+        }
+      }
+
+      throw new Error(`PP-OCR session creation failed: ${lastErrDetail || 'Unknown error'}`);
+    } catch (err: any) {
       sessionLoadFailures++;
-      isSessionLoading = false;
+      activeOcrProvider = 'NONE';
+      lastPpOcrError = err?.message || String(err);
+      console.warn(`[PP-OCR] Failed to initialize ONNX session:`, lastPpOcrError);
       return false;
     }
-    const dictText = await dictRes.text();
-    dictLines = dictText.split(/\r?\n/).map(l => l.trim());
-    dictLines.push(' '); // Append space character at index dictLines.length
-
-    // 2. Load ONNX Runtime Web
-    const ort = await getOrt();
-    const webGpuAvailable = typeof navigator !== 'undefined' && !!(navigator as any).gpu;
-    configureOrtWasm(ort, webGpuAvailable);
-
-    const modelRes = await fetch('/models/ppocr-rec.onnx');
-    if (!modelRes.ok) {
-      throw new Error(`HTTP ${modelRes.status} ${modelRes.statusText} fetching /models/ppocr-rec.onnx`);
-    }
-    const modelBuffer = await modelRes.arrayBuffer();
-    const modelBytes = new Uint8Array(modelBuffer);
-
-    let lastErrDetail = '';
-    const configsToTry = [
-      ...(webGpuAvailable ? [{ epList: ['webgpu', 'wasm'], opt: 'all', name: 'WebGPU' as ActiveOcrProvider }] : []),
-      { epList: ['wasm'], opt: 'all', name: 'WASM' as ActiveOcrProvider },
-      { epList: ['wasm'], opt: 'basic', name: 'WASM' as ActiveOcrProvider },
-    ];
-
-    for (const config of configsToTry) {
-      try {
-        const session = await ort.InferenceSession.create(modelBytes, {
-          executionProviders: config.epList,
-          graphOptimizationLevel: config.opt as any,
-        });
-
-        // Dummy inference validation
-        const dummyInput = new ort.Tensor('float32', new Float32Array(1 * 3 * 48 * 320), [1, 3, 48, 320]);
-        const inputName = session.inputNames[0] || 'x';
-        const dummyResults = await session.run({ [inputName]: dummyInput });
-
-        dummyInput.dispose?.();
-        for (const t of Object.values(dummyResults)) {
-          (t as any)?.dispose?.();
-        }
-
-        ppOcrSession = session;
-        activeOcrProvider = config.name;
-        sessionLoadFailures = 0;
-        isSessionLoading = false;
-        console.log(`[PP-OCR] ONNX Session initialized successfully with provider: ${config.name} (opt: ${config.opt})`);
-        return true;
-      } catch (err: any) {
-        lastErrDetail = err?.message || String(err);
-        console.warn(`[PP-OCR] Provider ${config.name} (opt: ${config.opt}) failed:`, lastErrDetail);
-      }
-    }
-
-    throw new Error(`PP-OCR session creation failed: ${lastErrDetail || 'Unknown error'}`);
-  } catch (err: any) {
-    sessionLoadFailures++;
-    activeOcrProvider = 'NONE';
-    lastPpOcrError = err?.message || String(err);
-    console.warn(`[PP-OCR] Failed to initialize ONNX session:`, lastPpOcrError);
+  })().finally(() => {
     isSessionLoading = false;
-    return false;
-  }
+    sessionLoadPromise = null;
+  });
+
+  return sessionLoadPromise;
 }
 
 export function isPpOcrReady(): boolean {

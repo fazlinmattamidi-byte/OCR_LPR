@@ -14,7 +14,8 @@
  */
 
 import { initLocalOnnxSession, getDetectorStatus, getActiveDetectorProvider, runBenchmarkDetection } from './yoloDetector';
-import { initPpOcrSession, isPpOcrReady, getActivePpOcrProvider, runBenchmarkOcr } from './ppOcrEngine';
+import { initPpOcrSession, isPpOcrReady, runBenchmarkOcr } from './ppOcrEngine';
+import { withTimeout } from './onnxRuntime';
 
 export type ANPRRuntimeState =
   | 'UNINITIALIZED'
@@ -55,6 +56,9 @@ export const DEFAULT_BENCHMARK_CONFIG: AdmissionBenchmarkConfig = {
 let currentRuntimeState: ANPRRuntimeState = 'UNINITIALIZED';
 let latestBenchmarkResult: AdmissionBenchmarkResult | null = null;
 let runtimeErrorMessage: string | null = null;
+let benchmarkRunId = 0;
+
+const ADMISSION_BENCHMARK_TIMEOUT_MS = 12000;
 
 export function getANPRRuntimeState(): ANPRRuntimeState {
   return currentRuntimeState;
@@ -103,34 +107,51 @@ export async function initializeANPRRuntime(
 
     currentRuntimeState = 'VALIDATING_MODELS';
     const detectorProvider = getActiveDetectorProvider();
-    const ocrProvider = getActivePpOcrProvider();
 
-    // 3. Benchmarking Device for WASM Admission Control
-    currentRuntimeState = 'BENCHMARKING_DEVICE';
-
-    const benchmark = await runAdmissionBenchmark(benchmarkConfig);
-    latestBenchmarkResult = benchmark;
-
-    if (detectorProvider === 'WebGPU') {
-      currentRuntimeState = 'READY_WEBGPU';
-      return { state: currentRuntimeState, benchmark };
-    }
-
-    if (benchmark.passed) {
-      currentRuntimeState = 'READY_WASM';
-      return { state: currentRuntimeState, benchmark };
-    }
-
-    // Performance below minimum admission threshold -> DEGRADED_PERFORMANCE
-    currentRuntimeState = 'DEGRADED_PERFORMANCE';
-    runtimeErrorMessage = benchmark.reason || 'Device performance below minimum admission threshold for live continuous scanning.';
-    return { state: currentRuntimeState, benchmark };
+    currentRuntimeState = detectorProvider === 'WebGPU' ? 'READY_WEBGPU' : 'READY_WASM';
+    startBackgroundAdmissionBenchmark(benchmarkConfig, currentRuntimeState);
+    return { state: currentRuntimeState };
 
   } catch (err: any) {
     currentRuntimeState = 'RUNTIME_ERROR';
     runtimeErrorMessage = err?.message || 'Unexpected ANPR runtime initialization error.';
     return { state: currentRuntimeState };
   }
+}
+
+function startBackgroundAdmissionBenchmark(
+  benchmarkConfig: AdmissionBenchmarkConfig,
+  readyState: ANPRRuntimeState
+): void {
+  const runId = ++benchmarkRunId;
+
+  withTimeout(
+    runAdmissionBenchmark(benchmarkConfig),
+    ADMISSION_BENCHMARK_TIMEOUT_MS,
+    'ANPR admission benchmark'
+  )
+    .then((benchmark) => {
+      if (runId !== benchmarkRunId) return;
+      latestBenchmarkResult = benchmark;
+
+      if (readyState === 'READY_WEBGPU' || benchmark.passed) {
+        if (currentRuntimeState === 'DEGRADED_PERFORMANCE') {
+          runtimeErrorMessage = null;
+        }
+        currentRuntimeState = readyState;
+        return;
+      }
+
+      currentRuntimeState = 'DEGRADED_PERFORMANCE';
+      runtimeErrorMessage = benchmark.reason || 'Device performance below minimum admission threshold for live continuous scanning.';
+    })
+    .catch((err: any) => {
+      if (runId !== benchmarkRunId) return;
+      if (currentRuntimeState === 'READY_WEBGPU' || currentRuntimeState === 'READY_WASM') {
+        currentRuntimeState = 'DEGRADED_PERFORMANCE';
+        runtimeErrorMessage = err?.message || 'Device benchmark timed out. Live scanning remains enabled with reduced performance diagnostics.';
+      }
+    });
 }
 
 /**

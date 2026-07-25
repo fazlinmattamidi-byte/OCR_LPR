@@ -8,7 +8,13 @@
  */
 
 import { detectPlateCandidatesCV } from './imageProcessor';
-import { configureOrtWasm, getOrt } from './onnxRuntime';
+import {
+  canUseWebGpuExecutionProvider,
+  configureOrtWasm,
+  fetchWithTimeout,
+  getOrt,
+  withTimeout,
+} from './onnxRuntime';
 
 export interface BoundingBox {
   x: number;      // top-left x in canvas pixels
@@ -38,8 +44,12 @@ let localOnnxSession: any = null;
 let detectorStatus: DetectorStatus = 'UNINITIALIZED';
 let activeProvider: ActiveExecutionProvider = 'NONE';
 let isOnnxLoading = false;
+let onnxLoadPromise: Promise<boolean> | null = null;
 let onnxLoadFailures = 0;
 const MAX_ONNX_FAILURES = 3;
+const MODEL_FETCH_TIMEOUT_MS = 20000;
+const PROVIDER_INIT_TIMEOUT_MS = 15000;
+const PROVIDER_WARMUP_TIMEOUT_MS = 8000;
 
 // Inference singletons for zero GC overhead
 let isInferring = false;
@@ -71,75 +81,93 @@ export async function initLocalOnnxSession(): Promise<boolean> {
     detectorStatus = 'FAILED';
     return false;
   }
-  if (isOnnxLoading) return false;
+  if (isOnnxLoading && onnxLoadPromise) return onnxLoadPromise;
 
   isOnnxLoading = true;
   detectorStatus = 'LOADING';
   lastDetectorError = null;
 
-  try {
-    const ort = await getOrt();
-    const webGpuAvailable = typeof navigator !== 'undefined' && !!(navigator as any).gpu;
-    
-    // Configure WASM paths to match the locally served runtime assets.
-    configureOrtWasm(ort, webGpuAvailable);
+  onnxLoadPromise = (async () => {
+    try {
+      const ort = await getOrt();
+      const webGpuAvailable = canUseWebGpuExecutionProvider();
 
-    // Fetch model into Uint8Array to bypass browser URL fetch restrictions on iOS Safari
-    const modelRes = await fetch('/models/plate-detector.onnx');
-    if (!modelRes.ok) {
-      throw new Error(`HTTP ${modelRes.status} ${modelRes.statusText} fetching /models/plate-detector.onnx`);
-    }
-    const modelBuffer = await modelRes.arrayBuffer();
-    const modelBytes = new Uint8Array(modelBuffer);
+      // Configure WASM paths to match the locally served runtime assets.
+      configureOrtWasm(ort, webGpuAvailable);
 
-    const providersToTry: { name: ActiveExecutionProvider; epList: string[] }[] = [
-      ...(webGpuAvailable ? [{ name: 'WebGPU' as const, epList: ['webgpu', 'wasm'] }] : []),
-      { name: 'WASM', epList: ['wasm'] },
-    ];
-    let lastErrDetail = '';
-
-    for (const item of providersToTry) {
-      try {
-        const session = await ort.InferenceSession.create(modelBytes, {
-          executionProviders: item.epList,
-          graphOptimizationLevel: 'all',
-        });
-
-        // Dummy inference to validate session functionality
-        const targetSize = 640;
-        const dummyInput = new ort.Tensor('float32', new Float32Array(3 * targetSize * targetSize), [1, 3, targetSize, targetSize]);
-        const inputName = session.inputNames[0] || 'images';
-        const dummyResults = await session.run({ [inputName]: dummyInput });
-
-        // Clean up dummy tensor output
-        dummyInput.dispose?.();
-        for (const t of Object.values(dummyResults)) {
-          (t as any)?.dispose?.();
-        }
-
-        localOnnxSession = session;
-        activeProvider = item.name;
-        detectorStatus = 'READY';
-        onnxLoadFailures = 0;
-        isOnnxLoading = false;
-        console.log(`[ANPR YoloDetector] Model initialized successfully with provider: ${item.name}`);
-        return true;
-      } catch (err: any) {
-        lastErrDetail = err?.message || String(err);
-        console.warn(`[ANPR YoloDetector] Provider ${item.name} failed initialization:`, lastErrDetail);
+      // Fetch model into Uint8Array to bypass browser URL fetch restrictions on iOS Safari
+      const modelRes = await fetchWithTimeout(
+        '/models/plate-detector.onnx',
+        MODEL_FETCH_TIMEOUT_MS,
+        'YOLOv8 detector model fetch'
+      );
+      if (!modelRes.ok) {
+        throw new Error(`HTTP ${modelRes.status} ${modelRes.statusText} fetching /models/plate-detector.onnx`);
       }
-    }
+      const modelBuffer = await modelRes.arrayBuffer();
+      const modelBytes = new Uint8Array(modelBuffer);
 
-    throw new Error(`All execution providers failed to run model.${lastErrDetail ? ` Last error: ${lastErrDetail}` : ''}`);
-  } catch (err: any) {
-    onnxLoadFailures++;
+      const providersToTry: { name: ActiveExecutionProvider; epList: string[] }[] = [
+        ...(webGpuAvailable ? [{ name: 'WebGPU' as const, epList: ['webgpu', 'wasm'] }] : []),
+        { name: 'WASM', epList: ['wasm'] },
+      ];
+      let lastErrDetail = '';
+
+      for (const item of providersToTry) {
+        try {
+          configureOrtWasm(ort, item.name === 'WebGPU');
+          const session = await withTimeout<any>(
+            ort.InferenceSession.create(modelBytes, {
+              executionProviders: item.epList,
+              graphOptimizationLevel: 'all',
+            }),
+            PROVIDER_INIT_TIMEOUT_MS,
+            `YOLOv8 detector ${item.name} session creation`
+          );
+
+          // Dummy inference to validate session functionality
+          const targetSize = 640;
+          const dummyInput = new ort.Tensor('float32', new Float32Array(3 * targetSize * targetSize), [1, 3, targetSize, targetSize]);
+          const inputName = session.inputNames[0] || 'images';
+          const dummyResults = await withTimeout<Record<string, any>>(
+            session.run({ [inputName]: dummyInput }),
+            PROVIDER_WARMUP_TIMEOUT_MS,
+            `YOLOv8 detector ${item.name} warm-up`
+          );
+
+          // Clean up dummy tensor output
+          dummyInput.dispose?.();
+          for (const t of Object.values(dummyResults)) {
+            (t as any)?.dispose?.();
+          }
+
+          localOnnxSession = session;
+          activeProvider = item.name;
+          detectorStatus = 'READY';
+          onnxLoadFailures = 0;
+          console.log(`[ANPR YoloDetector] Model initialized successfully with provider: ${item.name}`);
+          return true;
+        } catch (err: any) {
+          lastErrDetail = err?.message || String(err);
+          console.warn(`[ANPR YoloDetector] Provider ${item.name} failed initialization:`, lastErrDetail);
+        }
+      }
+
+      throw new Error(`All execution providers failed to run model.${lastErrDetail ? ` Last error: ${lastErrDetail}` : ''}`);
+    } catch (err: any) {
+      onnxLoadFailures++;
+      detectorStatus = 'FAILED';
+      activeProvider = 'NONE';
+      lastDetectorError = err?.message || String(err);
+      console.warn(`[ANPR YoloDetector] Local ONNX load failed (attempt ${onnxLoadFailures}/${MAX_ONNX_FAILURES}):`, lastDetectorError);
+      return false;
+    }
+  })().finally(() => {
     isOnnxLoading = false;
-    detectorStatus = 'FAILED';
-    activeProvider = 'NONE';
-    lastDetectorError = err?.message || String(err);
-    console.warn(`[ANPR YoloDetector] Local ONNX load failed (attempt ${onnxLoadFailures}/${MAX_ONNX_FAILURES}):`, lastDetectorError);
-    return false;
-  }
+    onnxLoadPromise = null;
+  });
+
+  return onnxLoadPromise;
 }
 
 export async function validateDetector(): Promise<{ valid: boolean; provider?: ActiveExecutionProvider }> {

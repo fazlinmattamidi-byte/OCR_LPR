@@ -6,6 +6,65 @@ const ORT_WASM_BINARY = `${ORT_PUBLIC_PATH}ort-wasm-simd-threaded.wasm`;
 const ORT_JSEP_MODULE = `${ORT_PUBLIC_PATH}ort-wasm-simd-threaded.jsep.mjs`;
 const ORT_JSEP_BINARY = `${ORT_PUBLIC_PATH}ort-wasm-simd-threaded.jsep.wasm`;
 
+export async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string
+): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+export async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  timeoutMs: number,
+  label: string,
+  init: RequestInit = {}
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: init.signal ?? controller.signal,
+    });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`${label} timed out after ${timeoutMs} ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+export function canUseWebGpuExecutionProvider(): boolean {
+  if (typeof navigator === 'undefined' || !(navigator as any).gpu) return false;
+
+  const userAgent = navigator.userAgent || '';
+  const platform = navigator.platform || '';
+  const maxTouchPoints = (navigator as any).maxTouchPoints || 0;
+  const isIOS =
+    /iPad|iPhone|iPod/i.test(userAgent) ||
+    (platform === 'MacIntel' && maxTouchPoints > 1);
+  const isSafari =
+    /Safari/i.test(userAgent) &&
+    !/Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS|Android/i.test(userAgent);
+
+  return !isIOS && !isSafari;
+}
+
 function loadScript(src: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const existingScript = document.querySelector<HTMLScriptElement>(`script[src="${src}"]`);
