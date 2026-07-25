@@ -34,7 +34,7 @@ import {
 } from '@/lib/anpr/imageProcessor';
 import { globalBestFrameSelector } from '@/lib/anpr/bestFrameSelector';
 import { recognizePlateFromCanvas } from '@/lib/anpr/ocrEngine';
-import { addOcrVoteToTrack, evaluateConsensus, getTrackReadingDisplay } from '@/lib/anpr/consensus';
+import { addOcrVoteToTrack, evaluateConsensus } from '@/lib/anpr/consensus';
 import { playAlertSound, triggerVibration } from '@/lib/utils/audio';
 import { VehicleCase, ScannerSettings } from '@/lib/db/types';
 import { INITIAL_SETTINGS } from '@/lib/db/settingsDefaults';
@@ -64,7 +64,7 @@ interface MatchEntry {
 function getTrackColor(track: ActiveTrack): string {
   if (track.matchType === 'EXACT') return '#ef4444';   // red
   if (track.matchType === 'POSSIBLE') return '#f59e0b'; // amber
-  if (track.matchType === 'NONE') return '#10b981';    // green
+  if (track.matchType === 'NONE') return '#00d8f6';    // cyan
   if (track.ocrState === 'COOLDOWN') return '#6b7280'; // grey
   return '#00d8f6';  // cyan — default / reading
 }
@@ -84,6 +84,24 @@ function getTrackStatusLabel(track: ActiveTrack): string {
   }
 }
 
+function getTrackPlateText(track: ActiveTrack): string {
+  if (track.stabilizedPlate) return track.stabilizedPlate;
+  if (!track.votes || track.votes.size === 0) return '';
+
+  let topPlate = '';
+  let topCount = 0;
+  let topTotalConfidence = 0;
+  track.votes.forEach((data, plateStr) => {
+    if (data.count > topCount || (data.count === topCount && data.totalConfidence > topTotalConfidence)) {
+      topPlate = plateStr;
+      topCount = data.count;
+      topTotalConfidence = data.totalConfidence;
+    }
+  });
+
+  return topPlate;
+}
+
 function isRuntimeScanningReady(state: ANPRRuntimeState): boolean {
   return state === 'READY_WEBGPU' || state === 'READY_WASM' || state === 'DEGRADED_PERFORMANCE';
 }
@@ -97,12 +115,94 @@ const CROP_SAMPLE_NORMAL_MS = 160;
 const OCR_FIRST_READ_RETRY_MS = 120;
 const OCR_REPEAT_READ_RETRY_MS = 260;
 const OCR_MAX_CONCURRENCY = 4;
+const OVERLAY_ANGLE_SAMPLE_MS = 140;
+const MAX_OVERLAY_TILT_RAD = 0.35;
 
 function getExpectedMinPlateChars(crop: HTMLCanvasElement): number {
   const aspect = crop.width / Math.max(1, crop.height);
   if (aspect >= 3.0) return 5;
   if (aspect >= 2.3) return 4;
   return 3;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function estimatePlateOverlayAngle(
+  sourceCanvas: HTMLCanvasElement,
+  bbox: { x: number; y: number; width: number; height: number },
+  previousAngle = 0
+): number {
+  const sourceWidth = sourceCanvas.width;
+  const sourceHeight = sourceCanvas.height;
+  const x = clampNumber(Math.round(bbox.x), 0, Math.max(0, sourceWidth - 1));
+  const y = clampNumber(Math.round(bbox.y), 0, Math.max(0, sourceHeight - 1));
+  const width = clampNumber(Math.round(bbox.width), 1, sourceWidth - x);
+  const height = clampNumber(Math.round(bbox.height), 1, sourceHeight - y);
+
+  if (width < 30 || height < 10) return previousAngle;
+
+  const ctx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return previousAngle;
+
+  try {
+    const image = ctx.getImageData(x, y, width, height);
+    const { data } = image;
+    const step = Math.max(1, Math.floor(Math.max(width, height) / 90));
+    let weightSum = 0;
+    let meanX = 0;
+    let meanY = 0;
+
+    const lumaAt = (px: number, py: number) => {
+      const idx = (py * width + px) * 4;
+      return data[idx] * 0.299 + data[idx + 1] * 0.587 + data[idx + 2] * 0.114;
+    };
+
+    for (let py = step; py < height - step; py += step) {
+      for (let px = step; px < width - step; px += step) {
+        const gx = Math.abs(lumaAt(px + step, py) - lumaAt(px - step, py));
+        const gy = Math.abs(lumaAt(px, py + step) - lumaAt(px, py - step));
+        const edge = gx + gy;
+        if (edge < 28) continue;
+        weightSum += edge;
+        meanX += px * edge;
+        meanY += py * edge;
+      }
+    }
+
+    if (weightSum < 1) return previousAngle;
+
+    meanX /= weightSum;
+    meanY /= weightSum;
+
+    let covXX = 0;
+    let covXY = 0;
+    let covYY = 0;
+
+    for (let py = step; py < height - step; py += step) {
+      for (let px = step; px < width - step; px += step) {
+        const gx = Math.abs(lumaAt(px + step, py) - lumaAt(px - step, py));
+        const gy = Math.abs(lumaAt(px, py + step) - lumaAt(px, py - step));
+        const edge = gx + gy;
+        if (edge < 28) continue;
+        const dx = px - meanX;
+        const dy = py - meanY;
+        covXX += dx * dx * edge;
+        covXY += dx * dy * edge;
+        covYY += dy * dy * edge;
+      }
+    }
+
+    let angle = 0.5 * Math.atan2(2 * covXY, covXX - covYY);
+    if (angle > Math.PI / 2) angle -= Math.PI;
+    if (angle < -Math.PI / 2) angle += Math.PI;
+    if (Math.abs(angle) > MAX_OVERLAY_TILT_RAD) angle = previousAngle;
+
+    return previousAngle * 0.60 + angle * 0.40;
+  } catch {
+    return previousAngle;
+  }
 }
 
 function getCameraPreflightError(): string | null {
@@ -664,6 +764,11 @@ export default function ScannerPage() {
       // ── Step 3: Best Frame Selection (Only on Confirmed Tracks) ──
       const cropSampleNow = Date.now();
       confirmedTracks.forEach(track => {
+        if (!track.lastOverlayAngleAt || cropSampleNow - track.lastOverlayAngleAt >= OVERLAY_ANGLE_SAMPLE_MS) {
+          track.overlayAngle = estimatePlateOverlayAngle(processingCanvas, track.bbox, track.overlayAngle ?? 0);
+          track.lastOverlayAngleAt = cropSampleNow;
+        }
+
         if (track.ocrState === 'COOLDOWN' || track.ocrState === 'MATCHED') return;
         const existingCrop = globalBestFrameSelector.getBestCrop(track.trackNumber);
         const sampleInterval = track.bbox.confidence >= 0.70 ? CROP_SAMPLE_FAST_MS : CROP_SAMPLE_NORMAL_MS;
@@ -919,38 +1024,54 @@ export default function ScannerPage() {
       const { x, y, width, height } = track.smoothBbox;
       const color = getTrackColor(track);
       const label = getTrackStatusLabel(track);
-      const reading = track.stabilizedPlate || getTrackReadingDisplay(track);
-      const displayNum = track.trackNumber;
+      const reading = getTrackPlateText(track);
+      const angle = track.overlayAngle ?? 0;
+      const cx = x + width / 2;
+      const cy = y + height / 2;
+      const boxW = width * 1.02;
+      const boxH = height * 1.08;
 
-      // NEW CLEAN UI DESIGN: White rounded box around plate
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
-      ctx.lineWidth = 2.5;
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(angle);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
       ctx.setLineDash([]);
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 8;
       ctx.beginPath();
-      ctx.roundRect(x, y, width, height, 6);
+      ctx.roundRect(-boxW / 2, -boxH / 2, boxW, boxH, 7);
       ctx.stroke();
+      ctx.restore();
 
       const labelText = reading || label;
 
       if (labelText) {
-        ctx.font = 'bold 12px sans-serif';
+        ctx.save();
+        ctx.font = 'bold 14px sans-serif';
         const textW = ctx.measureText(labelText).width;
-        const pillW = textW + 20;
+        const pillW = Math.max(56, textW + 18);
         const pillH = 26;
-        const pillX = x + (width / 2) - (pillW / 2); // Centered above box
-        const pillY = y - pillH - 8;
+        const normalX = Math.sin(angle);
+        const normalY = -Math.cos(angle);
+        const pillCx = clampNumber(cx + normalX * (boxH / 2 + pillH / 2 + 6), pillW / 2 + 2, W - pillW / 2 - 2);
+        const pillCy = clampNumber(cy + normalY * (boxH / 2 + pillH / 2 + 6), pillH / 2 + 2, H - pillH / 2 - 2);
+        const pillX = pillCx - pillW / 2;
+        const pillY = pillCy - pillH / 2;
 
-        // Dark semi-transparent pill background
-        ctx.fillStyle = 'rgba(15, 15, 20, 0.85)';
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 10;
+        ctx.fillStyle = color;
         ctx.beginPath();
-        ctx.roundRect(pillX, Math.max(2, pillY), pillW, pillH, 13);
+        ctx.roundRect(pillX, pillY, pillW, pillH, 6);
         ctx.fill();
 
-        // White text
-        ctx.fillStyle = '#ffffff';
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = track.matchType === 'EXACT' ? '#ffffff' : '#061018';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(labelText, pillX + pillW / 2, Math.max(2, pillY) + pillH / 2);
+        ctx.fillText(labelText, pillCx, pillCy);
+        ctx.restore();
       }
     });
   }
@@ -996,6 +1117,18 @@ export default function ScannerPage() {
         : isReadingPlate
           ? { label: 'READING PLATE', dotClass: 'bg-[#00d8f6] animate-pulse', textClass: 'text-[#00d8f6]' }
           : { label: 'SCANNING SCENE', dotClass: 'bg-amber-500 animate-pulse', textClass: 'text-amber-500' };
+  const resultTrack = tracksList.find(t => t.stabilizedPlate)
+    || tracksList.find(t => getTrackPlateText(t))
+    || null;
+  const resultPlateText = resultTrack ? getTrackPlateText(resultTrack) : '';
+  const hasResultCard = cameraReady && !cameraError && !!resultTrack && !!resultPlateText;
+  const resultStatus = resultTrack?.matchType === 'EXACT'
+    ? { label: 'Match Found', chipClass: 'bg-rose-500/15 text-rose-300 border-rose-400/40', iconClass: 'text-rose-300 bg-rose-500/15' }
+    : resultTrack?.matchType === 'POSSIBLE'
+      ? { label: 'Possible', chipClass: 'bg-amber-500/15 text-amber-300 border-amber-400/40', iconClass: 'text-amber-300 bg-amber-500/15' }
+      : resultTrack?.matchType === 'NONE'
+        ? { label: 'No Case', chipClass: 'bg-emerald-500/15 text-emerald-300 border-emerald-400/40', iconClass: 'text-emerald-300 bg-emerald-500/15' }
+        : { label: 'Active', chipClass: 'bg-[#00d8f6]/15 text-[#00d8f6] border-[#00d8f6]/40', iconClass: 'text-[#00d8f6] bg-[#00d8f6]/15' };
 
   return (
     <div className="fixed inset-0 bg-black flex flex-col overflow-hidden" style={{ zIndex: 100 }}>
@@ -1117,7 +1250,7 @@ export default function ScannerPage() {
 
         {/* BOTTOM SCANNING STATUS PILL */}
         {cameraReady && !cameraError && runtimeReady && (
-          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 transition-all duration-300 pointer-events-none">
+          <div className={`absolute ${hasResultCard ? (trayExpanded ? 'bottom-48' : 'bottom-32') : 'bottom-6'} left-1/2 -translate-x-1/2 z-30 transition-all duration-300 pointer-events-none`}>
             {(() => {
               if (isReadingPlate) {
                 return (
@@ -1210,6 +1343,66 @@ export default function ScannerPage() {
                 <span>{entry.type === 'EXACT' ? 'MATCH' : 'POSSIBLE'}</span>
               </button>
             ))}
+          </div>
+        )}
+
+        {hasResultCard && resultTrack && (
+          <div className="absolute bottom-3 left-3 right-3 z-30 pointer-events-auto">
+            <div className="rounded-2xl bg-[#101116]/95 border border-white/10 shadow-2xl backdrop-blur-md overflow-hidden">
+              <button
+                onClick={() => setTrayExpanded(v => !v)}
+                className="w-full flex items-center gap-3 px-4 py-3 text-left"
+              >
+                <div className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 ${resultStatus.iconClass}`}>
+                  {resultTrack.matchType === 'EXACT' ? (
+                    <AlertOctagon className="w-6 h-6" />
+                  ) : (
+                    <AlertTriangle className="w-6 h-6" />
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="font-mono text-xl font-black tracking-widest text-white leading-tight">
+                    {resultPlateText}
+                  </div>
+                  <div className={`mt-1 inline-flex items-center px-2.5 py-1 rounded-full border text-xs font-black ${resultStatus.chipClass}`}>
+                    {resultStatus.label}
+                  </div>
+                </div>
+                <div className="text-slate-500 shrink-0">
+                  {trayExpanded ? <ChevronDown className="w-5 h-5" /> : <ChevronUp className="w-5 h-5" />}
+                </div>
+              </button>
+
+              {trayExpanded && (resultTrack.matchedVehicle || (resultTrack.possibleMatchVehicles?.length ?? 0) > 0) && (
+                <div className="border-t border-white/10 px-4 pb-3 text-xs">
+                  {resultTrack.matchedVehicle && (
+                    <div className="grid grid-cols-2 gap-2 pt-3">
+                      <div className="rounded-lg bg-black/30 p-2">
+                        <div className="text-slate-500">Customer</div>
+                        <div className="text-white font-bold truncate">{resultTrack.matchedVehicle.customerName}</div>
+                      </div>
+                      <div className="rounded-lg bg-black/30 p-2">
+                        <div className="text-slate-500">Vehicle</div>
+                        <div className="text-white font-bold truncate">
+                          {resultTrack.matchedVehicle.vehicleMake} {resultTrack.matchedVehicle.vehicleModel}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {!resultTrack.matchedVehicle && (resultTrack.possibleMatchVehicles?.length ?? 0) > 0 && (
+                    <div className="pt-3 space-y-2">
+                      {resultTrack.possibleMatchVehicles?.slice(0, 2).map(v => (
+                        <div key={v.id} className="rounded-lg bg-black/30 p-2 flex items-center justify-between gap-2">
+                          <span className="font-mono font-bold text-white">{v.plateNumber}</span>
+                          <span className="text-slate-300 truncate">{v.vehicleMake} {v.vehicleModel}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>

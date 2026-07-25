@@ -22,6 +22,8 @@ export interface ActiveTrack {
   bbox: BoundingBox;          // Raw detection bbox (used for IoU / matching / cropping)
   smoothBbox: BoundingBox;    // EMA-smoothed bbox (used strictly for UI overlay rendering)
   predictedBbox?: BoundingBox;
+  overlayAngle?: number;
+  lastOverlayAngleAt?: number;
   vx: number; // velocity x (pixels per frame)
   vy: number; // velocity y (pixels per frame)
   cropSamples: TrackCropSample[];
