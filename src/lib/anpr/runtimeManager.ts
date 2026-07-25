@@ -8,9 +8,9 @@
  * Preferred Chain: WebGPU -> WASM (WebGL removed from production chain)
  * 
  * WASM Admission Benchmark Thresholds (Configurable):
- * - Detector P95 latency < 300 ms
- * - OCR P95 latency < 800 ms
- * - Sustainable live scanning FPS >= 3.0 FPS
+ * - Detector P95 latency < 500 ms
+ * - OCR P95 latency < 1200 ms
+ * - Sustainable live scanning FPS >= 2.0 FPS
  */
 
 import { initLocalOnnxSession, getDetectorStatus, getActiveDetectorProvider, runBenchmarkDetection } from './yoloDetector';
@@ -29,9 +29,9 @@ export type ANPRRuntimeState =
   | 'RUNTIME_ERROR';
 
 export interface AdmissionBenchmarkConfig {
-  maxDetectorP95Ms: number;  // Default: 300 ms
-  maxOcrP95Ms: number;       // Default: 800 ms
-  minSustainableFps: number; // Default: 3.0 FPS
+  maxDetectorP95Ms: number;  // Default: 500 ms
+  maxOcrP95Ms: number;       // Default: 1200 ms
+  minSustainableFps: number; // Default: 2.0 FPS
 }
 
 export interface AdmissionBenchmarkResult {
@@ -47,9 +47,9 @@ export interface AdmissionBenchmarkResult {
 }
 
 export const DEFAULT_BENCHMARK_CONFIG: AdmissionBenchmarkConfig = {
-  maxDetectorP95Ms: 300,
-  maxOcrP95Ms: 800,
-  minSustainableFps: 3.0,
+  maxDetectorP95Ms: 500,
+  maxOcrP95Ms: 1200,
+  minSustainableFps: 2.0,
 };
 
 let currentRuntimeState: ANPRRuntimeState = 'UNINITIALIZED';

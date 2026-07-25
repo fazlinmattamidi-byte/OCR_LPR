@@ -21,6 +21,32 @@ export interface MultiCropResult {
   bottomLineCanvas?: HTMLCanvasElement;
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function getAdaptiveCropTargetSize(
+  bbox: BoundingBox,
+  targetWidth: number,
+  targetHeight: number
+): { width: number; height: number } {
+  const rawAspect = bbox.width / Math.max(1, bbox.height);
+  const aspect = Number.isFinite(rawAspect) ? clamp(rawAspect, 0.8, 6.5) : 3.3;
+
+  if (aspect < 2.3) {
+    const width = aspect < 1.6 ? 256 : 320;
+    return {
+      width,
+      height: clamp(Math.round(width / aspect), 128, 260),
+    };
+  }
+
+  return {
+    width: targetWidth,
+    height: clamp(Math.round(targetWidth / aspect), 56, targetHeight),
+  };
+}
+
 /**
  * CV Heuristic Candidate Region Detection (Fallback when ONNX model is unavailable).
  */
@@ -285,6 +311,7 @@ export function generateAdaptiveCrops(
 
   for (const variant of variants) {
     const cropCanvas = document.createElement('canvas');
+    const outputSize = getAdaptiveCropTargetSize(bbox, targetWidth, targetHeight);
 
     // Auto-upscale small plates from distant vehicles
     let scaleFactor = 1.0;
@@ -292,8 +319,8 @@ export function generateAdaptiveCrops(
       scaleFactor = 1.6; // Upscale distant small plates
     }
 
-    const scaledW = Math.round(targetWidth * scaleFactor);
-    const scaledH = Math.round(targetHeight * scaleFactor);
+    const scaledW = Math.round(outputSize.width * scaleFactor);
+    const scaledH = Math.round(outputSize.height * scaleFactor);
 
     cropCanvas.width = scaledW;
     cropCanvas.height = scaledH;
@@ -538,5 +565,4 @@ export function prioritiseTracks(
   scored.sort((a, b) => b.priority - a.priority);
   return scored.slice(0, maxOcrSlots).map(s => s.trackId);
 }
-
 

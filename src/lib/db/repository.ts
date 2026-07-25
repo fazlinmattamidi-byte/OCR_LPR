@@ -432,7 +432,7 @@ export class PlateQRepository {
 
   static getSettings(): ScannerSettings {
     const store = loadStore();
-    return store.settings || INITIAL_SETTINGS;
+    return { ...INITIAL_SETTINGS, ...(store.settings || {}) };
   }
 
   static updateSettings(newSettings: Partial<ScannerSettings>): ScannerSettings {

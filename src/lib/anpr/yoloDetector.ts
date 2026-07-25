@@ -8,6 +8,7 @@
  */
 
 import { detectPlateCandidatesCV } from './imageProcessor';
+import { configureOrtWasm, getOrt } from './onnxRuntime';
 
 export interface BoundingBox {
   x: number;      // top-left x in canvas pixels
@@ -41,33 +42,10 @@ let onnxLoadFailures = 0;
 const MAX_ONNX_FAILURES = 3;
 
 // Inference singletons for zero GC overhead
-let ortModuleCache: any = null;
 let isInferring = false;
 let reusableCanvas: HTMLCanvasElement | null = null;
 let reusableCtx: CanvasRenderingContext2D | null = null;
 let reusableFloat32Data: Float32Array | null = null;
-
-async function getOrt(): Promise<any> {
-  if (typeof window === 'undefined') return null;
-  if ((window as any).ort) return (window as any).ort;
-
-  if (!ortModuleCache) {
-    ortModuleCache = new Promise((resolve, reject) => {
-      if ((window as any).ort) return resolve((window as any).ort);
-
-      const script = document.createElement('script');
-      script.src = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.min.js';
-      script.async = true;
-      script.onload = () => {
-        console.log('[ANPR YoloDetector] Loaded onnxruntime-web 1.27.0 via CDN script');
-        resolve((window as any).ort);
-      };
-      script.onerror = () => reject(new Error('Failed to load onnxruntime-web CDN script'));
-      document.head.appendChild(script);
-    });
-  }
-  return await ortModuleCache;
-}
 
 let lastDetectorError: string | null = null;
 
@@ -97,17 +75,14 @@ export async function initLocalOnnxSession(): Promise<boolean> {
 
   isOnnxLoading = true;
   detectorStatus = 'LOADING';
+  lastDetectorError = null;
 
   try {
     const ort = await getOrt();
+    const webGpuAvailable = typeof navigator !== 'undefined' && !!(navigator as any).gpu;
     
-    // Configure WASM paths to match installed onnxruntime-web version (1.27.0)
-    ort.env.wasm.numThreads = 1;
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      ort.env.wasm.wasmPaths = '/ort-wasm/';
-    } else {
-      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
-    }
+    // Configure WASM paths to match the locally served runtime assets.
+    configureOrtWasm(ort, webGpuAvailable);
 
     // Fetch model into Uint8Array to bypass browser URL fetch restrictions on iOS Safari
     const modelRes = await fetch('/models/plate-detector.onnx');
@@ -118,9 +93,10 @@ export async function initLocalOnnxSession(): Promise<boolean> {
     const modelBytes = new Uint8Array(modelBuffer);
 
     const providersToTry: { name: ActiveExecutionProvider; epList: string[] }[] = [
-      { name: 'WebGPU', epList: ['webgpu', 'wasm'] },
-      { name: 'WASM',   epList: ['wasm'] },
+      ...(webGpuAvailable ? [{ name: 'WebGPU' as const, epList: ['webgpu', 'wasm'] }] : []),
+      { name: 'WASM', epList: ['wasm'] },
     ];
+    let lastErrDetail = '';
 
     for (const item of providersToTry) {
       try {
@@ -148,12 +124,13 @@ export async function initLocalOnnxSession(): Promise<boolean> {
         isOnnxLoading = false;
         console.log(`[ANPR YoloDetector] Model initialized successfully with provider: ${item.name}`);
         return true;
-      } catch (err) {
-        console.warn(`[ANPR YoloDetector] Provider ${item.name} failed initialization:`, err);
+      } catch (err: any) {
+        lastErrDetail = err?.message || String(err);
+        console.warn(`[ANPR YoloDetector] Provider ${item.name} failed initialization:`, lastErrDetail);
       }
     }
 
-    throw new Error('All execution providers (WebGPU, WASM) failed to run model.');
+    throw new Error(`All execution providers failed to run model.${lastErrDetail ? ` Last error: ${lastErrDetail}` : ''}`);
   } catch (err: any) {
     onnxLoadFailures++;
     isOnnxLoading = false;

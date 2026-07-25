@@ -11,6 +11,7 @@
 import { CharacterConfidence, PlateCategory, PlateLayout } from '../db/types';
 import { normalizePlate, formatDisplayPlate, generateCandidatePlates } from './normaliser';
 import { validateMalaysianPattern } from './patterns';
+import { configureOrtWasm, getOrt } from './onnxRuntime';
 
 export interface PpOcrRecognitionResult {
   text: string;
@@ -34,33 +35,10 @@ let isSessionLoading = false;
 let sessionLoadFailures = 0;
 const MAX_SESSION_FAILURES = 3;
 
-let ortModuleCache: any = null;
 let activeOcrProvider: ActiveOcrProvider = 'NONE';
 let reusableOcrCanvas: HTMLCanvasElement | null = null;
 let reusableOcrCtx: CanvasRenderingContext2D | null = null;
 let reusableOcrFloat32Data: Float32Array | null = null;
-
-async function getOrt(): Promise<any> {
-  if (typeof window === 'undefined') return null;
-  if ((window as any).ort) return (window as any).ort;
-
-  if (!ortModuleCache) {
-    ortModuleCache = new Promise((resolve, reject) => {
-      if ((window as any).ort) return resolve((window as any).ort);
-
-      const script = document.createElement('script');
-      script.src = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.min.js';
-      script.async = true;
-      script.onload = () => {
-        console.log('[ANPR PP-OCR] Loaded onnxruntime-web 1.27.0 via CDN script');
-        resolve((window as any).ort);
-      };
-      script.onerror = () => reject(new Error('Failed to load onnxruntime-web CDN script'));
-      document.head.appendChild(script);
-    });
-  }
-  return await ortModuleCache;
-}
 
 let lastPpOcrError: string | null = null;
 
@@ -82,6 +60,7 @@ export async function initPpOcrSession(): Promise<boolean> {
   if (isSessionLoading) return false;
 
   isSessionLoading = true;
+  lastPpOcrError = null;
 
   try {
     // 1. Fetch character dictionary
@@ -98,12 +77,8 @@ export async function initPpOcrSession(): Promise<boolean> {
 
     // 2. Load ONNX Runtime Web
     const ort = await getOrt();
-    ort.env.wasm.numThreads = 1;
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      ort.env.wasm.wasmPaths = '/ort-wasm/';
-    } else {
-      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
-    }
+    const webGpuAvailable = typeof navigator !== 'undefined' && !!(navigator as any).gpu;
+    configureOrtWasm(ort, webGpuAvailable);
 
     const modelRes = await fetch('/models/ppocr-rec.onnx');
     if (!modelRes.ok) {
@@ -114,7 +89,7 @@ export async function initPpOcrSession(): Promise<boolean> {
 
     let lastErrDetail = '';
     const configsToTry = [
-      { epList: ['webgpu', 'wasm'], opt: 'all', name: 'WebGPU' as ActiveOcrProvider },
+      ...(webGpuAvailable ? [{ epList: ['webgpu', 'wasm'], opt: 'all', name: 'WebGPU' as ActiveOcrProvider }] : []),
       { epList: ['wasm'], opt: 'all', name: 'WASM' as ActiveOcrProvider },
       { epList: ['wasm'], opt: 'basic', name: 'WASM' as ActiveOcrProvider },
     ];

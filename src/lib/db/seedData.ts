@@ -322,7 +322,7 @@ export const INITIAL_SETTINGS: ScannerSettings = {
   soundEnabled: true,
   vibrationEnabled: true,
   detectorEngine: 'AUTO',
-  ocrEngine: 'TESSERACT',
+  ocrEngine: 'ONNX_MODEL',
   detectionThreshold: 0.35,
   recognitionThreshold: 0.60,
   characterConfidenceThreshold: 0.55,
@@ -345,4 +345,3 @@ export const INITIAL_SETTINGS: ScannerSettings = {
   debugMode: true,
   demoAssistance: false,
 };
-

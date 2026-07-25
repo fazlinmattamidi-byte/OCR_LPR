@@ -85,6 +85,154 @@ function getTrackStatusLabel(track: ActiveTrack): string {
   }
 }
 
+function getCameraPreflightError(): string | null {
+  if (typeof window === 'undefined') return null;
+
+  if (!window.isSecureContext) {
+    return `Camera access is blocked on this address (${window.location.host}). Open the scanner over HTTPS, or use localhost on the same desktop/laptop. iPhone Safari and Android browsers require HTTPS for camera access.`;
+  }
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return 'This browser does not expose camera access. Try a current mobile browser and allow camera permission.';
+  }
+
+  return null;
+}
+
+function getResolutionConstraints(
+  preferredResolution: ScannerSettings['preferredResolution']
+): Pick<MediaTrackConstraints, 'width' | 'height'> {
+  if (preferredResolution === '1080p') {
+    return { width: { ideal: 1920 }, height: { ideal: 1080 } };
+  }
+
+  if (preferredResolution === '480p') {
+    return { width: { ideal: 854 }, height: { ideal: 480 } };
+  }
+
+  return { width: { ideal: 1280 }, height: { ideal: 720 } };
+}
+
+function isSavedDeviceId(preferredCamera?: string): boolean {
+  return !!preferredCamera && !['environment', 'user', 'default', 'any'].includes(preferredCamera);
+}
+
+function buildCameraConstraintCandidates(
+  settings: ScannerSettings,
+  requestedDeviceId?: string
+): Array<MediaTrackConstraints | boolean> {
+  const resolution = getResolutionConstraints(settings.preferredResolution);
+  const candidates: Array<MediaTrackConstraints | boolean> = [];
+  const seen = new Set<string>();
+  const add = (video: MediaTrackConstraints | boolean) => {
+    const key = typeof video === 'boolean' ? String(video) : JSON.stringify(video);
+    if (!seen.has(key)) {
+      seen.add(key);
+      candidates.push(video);
+    }
+  };
+
+  if (requestedDeviceId) {
+    add({ ...resolution, deviceId: { exact: requestedDeviceId } });
+    add({ ...resolution, deviceId: { ideal: requestedDeviceId } });
+  }
+
+  if (!requestedDeviceId && isSavedDeviceId(settings.preferredCamera)) {
+    add({ ...resolution, deviceId: { exact: settings.preferredCamera } });
+    add({ ...resolution, deviceId: { ideal: settings.preferredCamera } });
+  }
+
+  const preferredFacing = settings.preferredCamera === 'user' ? 'user' : 'environment';
+  const fallbackFacing = preferredFacing === 'environment' ? 'user' : 'environment';
+
+  add({ ...resolution, facingMode: { ideal: preferredFacing } });
+  add({ ...resolution, facingMode: { ideal: fallbackFacing } });
+  add({ ...resolution });
+  add(true);
+
+  return candidates;
+}
+
+async function enumerateVideoDevices(): Promise<MediaDeviceInfo[]> {
+  try {
+    const allDevices = await navigator.mediaDevices.enumerateDevices();
+    return allDevices.filter(d => d.kind === 'videoinput');
+  } catch {
+    return [];
+  }
+}
+
+async function openCompatibleCamera(
+  settings: ScannerSettings,
+  requestedDeviceId?: string
+): Promise<MediaStream> {
+  const candidates = buildCameraConstraintCandidates(settings, requestedDeviceId);
+  let lastError: any = null;
+
+  for (const video of candidates) {
+    try {
+      return await navigator.mediaDevices.getUserMedia({ audio: false, video });
+    } catch (err) {
+      lastError = err;
+      console.warn('[Scanner] Camera constraint failed, trying fallback:', err);
+    }
+  }
+
+  throw lastError || new Error('No compatible camera constraints found.');
+}
+
+async function attachCameraStream(video: HTMLVideoElement, stream: MediaStream): Promise<void> {
+  video.srcObject = stream;
+  video.muted = true;
+  video.playsInline = true;
+
+  if (video.readyState < HTMLMediaElement.HAVE_METADATA || video.videoWidth === 0) {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(() => resolve(), 2500);
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        video.removeEventListener('loadedmetadata', onReady);
+        video.removeEventListener('canplay', onReady);
+        video.removeEventListener('error', onError);
+      };
+      const onReady = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        cleanup();
+        reject(new Error('Camera stream could not attach to video preview.'));
+      };
+
+      video.addEventListener('loadedmetadata', onReady, { once: true });
+      video.addEventListener('canplay', onReady, { once: true });
+      video.addEventListener('error', onError, { once: true });
+    });
+  }
+
+  await video.play();
+}
+
+function getCameraErrorMessage(err: any): string {
+  if (err?.name === 'NotAllowedError') {
+    return 'Camera permission denied. Allow camera access in browser settings and retry.';
+  }
+  if (err?.name === 'NotFoundError') {
+    return 'No camera device found. Connect a webcam or enable the built-in camera, then retry.';
+  }
+  if (err?.name === 'NotReadableError') {
+    return 'Camera is already in use by another application.';
+  }
+  if (err?.name === 'OverconstrainedError') {
+    return 'Requested camera settings are not supported by this device. Retrying with a different camera or lower resolution may help.';
+  }
+  if (err?.name === 'SecurityError') {
+    return 'Camera access requires HTTPS or localhost.';
+  }
+
+  return err?.message || 'Unable to access camera.';
+}
+
 export default function ScannerPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -138,6 +286,19 @@ export default function ScannerPage() {
   const cooldownMap = useRef<Map<string, number>>(new Map());
   const activeOcrCount = useRef(0);
 
+  const resetLiveScanUi = useCallback(() => {
+    trackerRef.current.clear();
+    globalBestFrameSelector.resetAll();
+    camFrameCount.current = 0;
+    detFrameCount.current = 0;
+    activeOcrCount.current = 0;
+    setTracksList([]);
+    setPlatesVisible(0);
+    setActiveTracksCount(0);
+    setCamFps(0);
+    setDetFps(0);
+  }, []);
+
   const startRuntimeInit = useCallback(async () => {
     setRuntimeState('LOADING_MODELS');
     const res = await initializeANPRRuntime();
@@ -172,50 +333,54 @@ export default function ScannerPage() {
     try {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(t => t.stop());
+        streamRef.current = null;
+      }
+      resetLiveScanUi();
+
+      const preflightError = getCameraPreflightError();
+      if (preflightError) {
+        setTorchOn(false);
+        setTorchSupported(false);
+        setCameraError(preflightError);
+        return;
       }
 
       const s = settingsRef.current;
-      const constraints: MediaStreamConstraints = {
-        audio: false,
-        video: deviceId
-          ? { deviceId: { exact: deviceId } }
-          : {
-              facingMode: { ideal: 'environment' },
-              width: { ideal: s.preferredResolution === '1080p' ? 1920 : 1280 },
-              height: { ideal: s.preferredResolution === '1080p' ? 1080 : 720 },
-            },
-      };
-
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      const stream = await openCompatibleCamera(s, deviceId);
       streamRef.current = stream;
 
       if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
+        await attachCameraStream(videoRef.current, stream);
       }
 
-      const allDevices = await navigator.mediaDevices.enumerateDevices();
-      const videoDevs = allDevices.filter(d => d.kind === 'videoinput');
+      const videoDevs = await enumerateVideoDevices();
       setDevices(videoDevs);
 
       const track = stream.getVideoTracks()[0];
       if (track) {
-        const caps = track.getCapabilities() as any;
+        const trackSettings = typeof track.getSettings === 'function' ? track.getSettings() : {};
+        if (trackSettings.deviceId) {
+          setSelectedDeviceId(trackSettings.deviceId);
+        } else if (deviceId) {
+          setSelectedDeviceId(deviceId);
+        }
+
+        const caps = typeof track.getCapabilities === 'function' ? track.getCapabilities() as any : {};
         setTorchSupported(!!caps?.torch);
       }
 
       setCameraReady(true);
     } catch (err: any) {
-      let msg = 'Gagal mengakses kamera.';
-      if (err.name === 'NotAllowedError')
-        msg = 'Camera permission denied. Allow camera access in browser settings and retry.';
-      else if (err.name === 'NotFoundError')
-        msg = 'No camera device found on this device.';
-      else if (err.name === 'NotReadableError')
-        msg = 'Camera is already in use by another application.';
-      setCameraError(msg);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop());
+        streamRef.current = null;
+      }
+      resetLiveScanUi();
+      setTorchOn(false);
+      setTorchSupported(false);
+      setCameraError(getCameraErrorMessage(err));
     }
-  }, []);
+  }, [resetLiveScanUi]);
 
   useEffect(() => {
     initCamera();
@@ -243,7 +408,6 @@ export default function ScannerPage() {
     const next = devices[(idx + 1) % devices.length];
     setSelectedDeviceId(next.deviceId);
     initCamera(next.deviceId);
-    trackerRef.current.clear();
   };
 
   // ─── 5. Pause / Resume ──────────────────────────────────────────────────
@@ -464,9 +628,37 @@ export default function ScannerPage() {
           try {
             // Memory optimization: generate Adaptive Crops only when needed
             const adaptiveCrops = generateAdaptiveCrops(targetCrop, {x:0, y:0, width: targetCrop.width, height: targetCrop.height, confidence: 1.0});
-            const bestCropVariant = adaptiveCrops[0]?.canvas || targetCrop;
+            const preferredVariants = ['ORIGINAL', 'SHARPEN', 'DARK_BG'] as const;
+            const preferredCrops = preferredVariants
+              .map(variant => adaptiveCrops.find(c => c.variant === variant))
+              .filter((crop): crop is (typeof adaptiveCrops)[number] => Boolean(crop));
+            const candidateCrops = [...preferredCrops, ...adaptiveCrops]
+              .filter((crop, index, list) => crop && list.findIndex(item => item?.canvas === crop.canvas) === index)
+              .slice(0, 4);
+            const fallbackCrop = {
+              canvas: targetCrop,
+              isTwoLine: targetCrop.width / Math.max(1, targetCrop.height) < 2.3,
+            };
 
-            const { text, confidence: conf } = await recognizePlateFromCanvas(bestCropVariant);
+            let text = '';
+            let conf = 0;
+            let bestScore = 0;
+
+            for (const crop of candidateCrops.length > 0 ? candidateCrops : [fallbackCrop]) {
+              const result = await recognizePlateFromCanvas(crop.canvas, crop.isTwoLine);
+              const score = result.confidence * 0.65 + result.patternScore * 0.35;
+
+              if (result.text && score >= bestScore) {
+                text = result.text;
+                conf = result.confidence;
+                bestScore = score;
+              }
+
+              if (result.text && result.confidence >= 0.30 && result.patternScore >= 0.55) {
+                break;
+              }
+            }
+
             const updatedTrack = trackerRef.current.getTrack(trackId);
             if (!updatedTrack || updatedTrack.cooldownActive) return;
 
@@ -605,6 +797,18 @@ export default function ScannerPage() {
   };
 
   const activeMatches = matchQueue.filter(m => !m.dismissed);
+  const isReadingPlate = cameraReady && !cameraError && tracksList.some(
+    t => ['COLLECTING', 'OCR_RUNNING', 'OCR RUNNING', 'CONSENSUS_BUILDING', 'CONSENSUS', 'DB_CHECKING', 'DATABASE CHECK'].includes(t.ocrState)
+  );
+  const bottomStatus = cameraError
+    ? { label: 'CAMERA UNAVAILABLE', dotClass: 'bg-rose-500', textClass: 'text-rose-400' }
+    : !cameraReady
+      ? { label: 'STARTING CAMERA', dotClass: 'bg-slate-500 animate-pulse', textClass: 'text-slate-400' }
+      : isPaused
+        ? { label: 'SCANNER PAUSED', dotClass: 'bg-slate-500', textClass: 'text-slate-400' }
+        : isReadingPlate
+          ? { label: 'READING PLATE', dotClass: 'bg-[#00d8f6] animate-pulse', textClass: 'text-[#00d8f6]' }
+          : { label: 'SCANNING SCENE', dotClass: 'bg-amber-500 animate-pulse', textClass: 'text-amber-500' };
 
   return (
     <div className="fixed inset-0 bg-black flex flex-col overflow-hidden" style={{ zIndex: 100 }}>
@@ -663,18 +867,20 @@ export default function ScannerPage() {
       </div>
 
       {/* ── MODEL STATUS BANNER (Only renders on error/degraded or if debugMode is true) ── */}
-      <div className="px-3 py-1.5 z-20">
-        <ModelStatusBanner
-          runtimeState={runtimeState}
-          detectorProvider={detectorProvider}
-          ocrProvider={ocrProvider}
-          benchmark={benchmarkResult}
-          errorMessage={runtimeErrorMessage}
-          debugMode={isDebugMode}
-          onRetry={startRuntimeInit}
-          onManualSearch={() => window.location.href = '/search'}
-        />
-      </div>
+      {!cameraError && (
+        <div className="px-3 py-1.5 z-20">
+          <ModelStatusBanner
+            runtimeState={runtimeState}
+            detectorProvider={detectorProvider}
+            ocrProvider={ocrProvider}
+            benchmark={benchmarkResult}
+            errorMessage={runtimeErrorMessage}
+            debugMode={isDebugMode}
+            onRetry={startRuntimeInit}
+            onManualSearch={() => window.location.href = '/search'}
+          />
+        </div>
+      )}
 
       {/* ── DEBUG PERFORMANCE CHIP (Strictly gated behind debugMode === true) ── */}
       {isDebugMode && (
@@ -723,25 +929,26 @@ export default function ScannerPage() {
         })()}
 
         {/* BOTTOM SCANNING STATUS PILL */}
-        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 transition-all duration-300 pointer-events-none">
-          {(() => {
-            const readingTrack = tracksList.find(t => t.ocrState === 'COLLECTING' || t.ocrState === 'OCR_RUNNING' || t.ocrState === 'CONSENSUS_BUILDING');
-            if (readingTrack) {
+        {cameraReady && !cameraError && (
+          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 transition-all duration-300 pointer-events-none">
+            {(() => {
+              if (isReadingPlate) {
+                return (
+                  <div className="bg-[#00d8f6]/95 text-slate-950 px-6 py-2.5 rounded-full font-bold text-xs shadow-2xl border border-[#00d8f6] backdrop-blur-md flex items-center gap-2 animate-pulse">
+                    <span className="w-2 h-2 rounded-full bg-slate-950 animate-ping" />
+                    <span>Reading plate...</span>
+                  </div>
+                );
+              }
               return (
-                <div className="bg-[#00d8f6]/95 text-slate-950 px-6 py-2.5 rounded-full font-bold text-xs shadow-2xl border border-[#00d8f6] backdrop-blur-md flex items-center gap-2 animate-pulse">
-                  <span className="w-2 h-2 rounded-full bg-slate-950 animate-ping" />
-                  <span>Reading plate...</span>
+                <div className="bg-[#1a1c23]/95 text-slate-200 px-6 py-2.5 rounded-full font-semibold text-xs shadow-2xl border border-white/10 backdrop-blur-md flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                  <span>Scanning scene for plates...</span>
                 </div>
               );
-            }
-            return (
-              <div className="bg-[#1a1c23]/95 text-slate-200 px-6 py-2.5 rounded-full font-semibold text-xs shadow-2xl border border-white/10 backdrop-blur-md flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-                <span>Scanning scene for plates...</span>
-              </div>
-            );
-          })()}
-        </div>
+            })()}
+          </div>
+        )}
         {cameraError && (
           <div className="absolute inset-0 flex items-center justify-center bg-[#090a0f] z-10 p-6">
             <div className="max-w-sm text-center">
@@ -824,9 +1031,9 @@ export default function ScannerPage() {
       <div className="flex-shrink-0 bg-[#090a0f] border-t border-[#252833] flex flex-col">
         {/* STATUS INDICATOR */}
         <div className="flex items-center gap-3 px-6 py-4 border-b border-[#252833]">
-          <div className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse" />
-          <span className="text-amber-500 text-xs font-bold tracking-widest uppercase">
-            {tracksList.some(t => t.ocrState === 'COLLECTING' || t.ocrState === 'OCR RUNNING') ? 'READING PLATE' : 'SCANNING SCENE'}
+          <div className={`w-2.5 h-2.5 rounded-full ${bottomStatus.dotClass}`} />
+          <span className={`${bottomStatus.textClass} text-xs font-bold tracking-widest uppercase`}>
+            {bottomStatus.label}
           </span>
         </div>
         
