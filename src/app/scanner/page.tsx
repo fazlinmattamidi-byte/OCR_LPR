@@ -156,9 +156,15 @@ function isPlausiblePlateCandidate(
   return true;
 }
 
-function canCommitNoCasePlate(text: string, patternScore: number, voteCount: number, minVotes: number): boolean {
-  const { digits } = countPlateChars(text);
-  return voteCount >= Math.max(3, minVotes) && patternScore >= 0.55 && digits >= 2;
+function canCommitFinalPlateOutcome(text: string): boolean {
+  const pattern = validateMalaysianPattern(text);
+  const { letters, digits } = countPlateChars(text);
+
+  if (!pattern.isValid || pattern.score < 0.55) return false;
+  if (letters === 0 || digits === 0) return false;
+  if (text.length >= 5 && digits < 2) return false;
+
+  return true;
 }
 
 function estimatePlateOverlayAngle(
@@ -633,10 +639,10 @@ export default function ScannerPage() {
     const cooldownMs = settingsRef.current.duplicateCooldown * 1000;
     const now = Date.now();
     const lastSearch = cooldownMap.current.get(plate) ?? 0;
-    const trackSearchThrottleMs = commitNoCase ? cooldownMs : 1500;
+    const trackSearchThrottleMs = commitNoCase ? 0 : 1000;
 
     if (commitNoCase && now - lastSearch < cooldownMs) return;
-    if (track.lastSearchedAt && now - track.lastSearchedAt < trackSearchThrottleMs) return;
+    if (trackSearchThrottleMs > 0 && track.lastSearchedAt && now - track.lastSearchedAt < trackSearchThrottleMs) return;
     track.lastSearchedAt = now;
 
     track.ocrState = 'DB_CHECKING';
@@ -648,7 +654,10 @@ export default function ScannerPage() {
         body: JSON.stringify({ plateNumber: plate, source: 'CAMERA', confidence }),
       }).then(r => r.json());
 
-      if (!searchRes.success) return;
+      if (!searchRes.success) {
+        track.ocrState = 'CONSENSUS_BUILDING';
+        return;
+      }
 
       if (!commitNoCase && searchRes.matchType !== 'EXACT' && searchRes.matchType !== 'POSSIBLE') {
         track.ocrState = 'CONSENSUS_BUILDING';
@@ -656,6 +665,11 @@ export default function ScannerPage() {
       }
 
       cooldownMap.current.set(plate, now);
+      const resolvedMatchType = searchRes.matchType === 'EXACT'
+        ? 'EXACT'
+        : searchRes.matchType === 'POSSIBLE'
+          ? 'POSSIBLE'
+          : 'NONE';
 
       const scanRes = await fetch('/api/scans', {
         method: 'POST',
@@ -664,7 +678,7 @@ export default function ScannerPage() {
           detectedPlate: plate,
           normalizedPlate: plate,
           confidence,
-          matchType: searchRes.matchType,
+          matchType: resolvedMatchType,
           matchedVehicleId: searchRes.matchedVehicle?.id ?? undefined,
           source: 'CAMERA',
           trackId: track.trackId,
@@ -673,7 +687,7 @@ export default function ScannerPage() {
         }),
       }).then(r => r.json());
 
-      track.matchType = searchRes.matchType === 'EXACT' ? 'EXACT' : searchRes.matchType === 'POSSIBLE' ? 'POSSIBLE' : 'NONE';
+      track.matchType = resolvedMatchType;
       track.matchedVehicle = searchRes.matchedVehicle ?? undefined;
       track.possibleMatchVehicles = searchRes.possibleMatches ?? [];
       track.ocrState = track.matchType === 'EXACT' ? 'MATCHED' : track.matchType === 'POSSIBLE' ? 'POSSIBLE MATCH' : 'NO CASE';
@@ -944,7 +958,6 @@ export default function ScannerPage() {
             let text = '';
             let conf = 0;
             let bestScore = 0;
-            let bestPatternScore = 0;
             let bestPatternValid = false;
 
             for (const crop of candidateCrops.length > 0 ? candidateCrops : [fallbackCrop]) {
@@ -965,7 +978,6 @@ export default function ScannerPage() {
                 text = resultText;
                 conf = result.confidence;
                 bestScore = score;
-                bestPatternScore = pattern.score;
                 bestPatternValid = pattern.isValid;
               }
 
@@ -999,14 +1011,9 @@ export default function ScannerPage() {
                 const matchConfidence = Math.max(consensus.confidence, Math.min(0.98, bestScore));
                 updatedTrack.stabilizedPlate = consensus.normalizedPlate;
                 updatedTrack.stabilizedConfidence = matchConfidence;
-                const noCaseReady = canCommitNoCasePlate(
-                  consensus.normalizedPlate,
-                  bestPatternScore,
-                  consensus.voteCount,
-                  s.consensusVotes
-                );
+                const finalOutcomeReady = canCommitFinalPlateOutcome(consensus.normalizedPlate);
                 await runDatabaseMatch(updatedTrack, consensus.normalizedPlate, matchConfidence, {
-                  commitNoCase: noCaseReady,
+                  commitNoCase: finalOutcomeReady,
                 });
               }
             } else {
