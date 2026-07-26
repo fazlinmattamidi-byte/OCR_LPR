@@ -1,24 +1,34 @@
 'use client';
 
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
+import { useLanguage } from '@/context/LanguageContext';
+import { useStorage } from '@/context/StorageContext';
+import { useAuth } from '@/context/AuthContext';
+import { cleanPlateNumber, formatMYR } from '@/lib/utils';
+import { DetectionLog, Vehicle } from '@/types';
 import {
-  ArrowLeft,
-  SwitchCamera,
-  Zap,
-  ZapOff,
-  AlertOctagon,
+  Activity,
   AlertTriangle,
+  ArrowLeft,
+  BookmarkCheck,
+  Car,
+  CheckCircle2,
+  Database,
+  DollarSign,
+  FileSearch,
+  MapPin,
   Pause,
   Play,
-  Settings as SettingsIcon,
-  ChevronDown,
-  ChevronUp,
-  LayoutGrid,
-  Search,
-  Camera,
-  Car,
+  Plus,
+  Search as SearchIcon,
+  ShieldAlert,
+  Video,
+  Volume2,
+  VolumeX,
+  X,
+  XCircle,
 } from 'lucide-react';
-import Link from 'next/link';
 import { PlateTracker, ActiveTrack } from '@/lib/anpr/tracker';
 import {
   detectMalaysianPlates,
@@ -33,13 +43,9 @@ import {
   prioritiseTracks,
   releaseCanvasMemory,
 } from '@/lib/anpr/imageProcessor';
-import { globalBestFrameSelector } from '@/lib/anpr/bestFrameSelector';
+import { BestFrameSelector } from '@/lib/anpr/bestFrameSelector';
 import { recognizePlateFromCanvas } from '@/lib/anpr/ocrEngine';
 import { addOcrVoteToTrack, evaluateConsensus } from '@/lib/anpr/consensus';
-import { playAlertSound, triggerVibration } from '@/lib/utils/audio';
-import { VehicleCase, ScannerSettings } from '@/lib/db/types';
-import { INITIAL_SETTINGS } from '@/lib/db/settingsDefaults';
-import { ModelStatusBanner } from '@/components/scanner/ModelStatusBanner';
 import {
   initializeANPRRuntime,
   getANPRRuntimeState,
@@ -50,39 +56,105 @@ import {
 } from '@/lib/anpr/runtimeManager';
 import { getActivePpOcrProvider, isPpOcrReady, ActiveOcrProvider } from '@/lib/anpr/ppOcrEngine';
 import { validateMalaysianPattern } from '@/lib/anpr/patterns';
+import { evaluateDatabaseMatch } from '@/lib/anpr/matchingEngine';
+import { INITIAL_SETTINGS } from '@/lib/db/settingsDefaults';
+import { ScannerSettings, VehicleCase } from '@/lib/db/types';
+import { ModelStatusBanner } from '@/components/scanner/ModelStatusBanner';
 
-interface MatchEntry {
-  type: 'EXACT' | 'POSSIBLE';
-  plate: string;
-  trackId: string;
-  vehicle: VehicleCase | null;
-  possibleMatches: VehicleCase[];
-  confidence: number;
-  scanId?: string;
-  timestamp: number;
-  dismissed: boolean;
-}
+type AlertMatch = {
+  vehicle: Vehicle;
+  cameraName: string;
+  cameraId: string;
+};
+
+type CameraSlot = {
+  id: string;
+  deviceId: string;
+};
+
+type ScanLocation = {
+  name: string;
+  gps: string;
+};
+
+type SessionDetection = DetectionLog &
+  ScanLocation & {
+    matchType?: 'EXACT' | 'POSSIBLE' | 'NONE';
+    possibleVehicleIds?: string[];
+  };
+
+type AudioWindow = Window &
+  typeof globalThis & {
+    webkitAudioContext?: typeof AudioContext;
+  };
+
+type SlotScannerRuntime = {
+  tracker: PlateTracker;
+  bestFrameSelector: BestFrameSelector;
+  processingCanvas: HTMLCanvasElement | null;
+  lastMaintenanceTs: number;
+};
+
+type SlotMetrics = {
+  camFrames: number;
+  detFrames: number;
+  platesVisible: number;
+  activeTracks: number;
+  tracks: ActiveTrack[];
+};
+
+const SCAN_LOCATIONS: ScanLocation[] = [
+  { name: 'Sungai Besi Toll Plaza', gps: '3.0602, 101.7047' },
+  { name: 'Jalan Tun Razak, Kuala Lumpur', gps: '3.1618, 101.7165' },
+  { name: 'Federal Highway KM12', gps: '3.0837, 101.6129' },
+  { name: 'Shah Alam Section 13', gps: '3.0831, 101.5443' },
+  { name: 'Penang Bridge Checkpoint', gps: '5.3674, 100.3422' },
+];
+
+const RECENT_DETECTIONS_STORAGE_KEY = 'track_recent_live_detections';
+const DETECTION_TARGET_INTERVAL_MS = 90;
+const DETECTION_BUSY_INTERVAL_MS = 125;
+const DETECTION_MIN_DELAY_MS = 16;
+const DETECTOR_VALIDATION_INTERVAL_MS = 2000;
+const CROP_SAMPLE_FAST_MS = 90;
+const CROP_SAMPLE_NORMAL_MS = 160;
+const OCR_FIRST_READ_RETRY_MS = 80;
+const OCR_REPEAT_READ_RETRY_MS = 180;
+const OCR_MAX_CONCURRENCY = 4;
+const OVERLAY_ANGLE_SAMPLE_MS = 140;
+const MAX_OVERLAY_TILT_RAD = 0.35;
+const SCANNER_MAINTENANCE_INTERVAL_MS = 1000;
+const COOLDOWN_MAP_MAX_ENTRIES = 120;
+const TRACK_RESULT_HOLD_MS = 900;
 
 function getTrackColor(track: ActiveTrack): string {
-  if (track.matchType === 'EXACT') return '#ef4444';   // red
-  if (track.matchType === 'POSSIBLE') return '#f59e0b'; // amber
-  if (track.matchType === 'NONE') return '#00d8f6';    // cyan
-  if (track.ocrState === 'COOLDOWN') return '#6b7280'; // grey
-  return '#00d8f6';  // cyan — default / reading
+  if (track.matchType === 'EXACT') return '#ef4444';
+  if (track.matchType === 'POSSIBLE') return '#f59e0b';
+  if (track.matchType === 'NONE') return '#06b6d4';
+  if (track.ocrState === 'COOLDOWN') return '#64748b';
+  return '#06b6d4';
 }
 
 function getTrackStatusLabel(track: ActiveTrack): string {
   if (track.matchType === 'EXACT') return 'MATCH';
   if (track.matchType === 'POSSIBLE') return 'POSSIBLE';
   if (track.matchType === 'NONE') return 'NO CASE';
+
   switch (track.ocrState) {
-    case 'DETECTED': return 'DETECTED';
-    case 'COLLECTING': return 'COLLECTING';
-    case 'OCR_RUNNING': return 'READING…';
-    case 'CONSENSUS_BUILDING': return 'ANALYSING';
-    case 'DB_CHECKING': return 'CHECKING…';
-    case 'COOLDOWN': return 'COOLDOWN';
-    default: return 'SCANNING';
+    case 'DETECTED':
+      return 'DETECTED';
+    case 'COLLECTING':
+      return 'COLLECTING';
+    case 'OCR_RUNNING':
+      return 'READING';
+    case 'CONSENSUS_BUILDING':
+      return 'ANALYSING';
+    case 'DB_CHECKING':
+      return 'CHECKING';
+    case 'COOLDOWN':
+      return 'COOLDOWN';
+    default:
+      return 'SCANNING';
   }
 }
 
@@ -108,23 +180,14 @@ function isRuntimeScanningReady(state: ANPRRuntimeState): boolean {
   return state === 'READY_WEBGPU' || state === 'READY_WASM' || state === 'DEGRADED_PERFORMANCE';
 }
 
-const DETECTION_TARGET_INTERVAL_MS = 90;
-const DETECTION_BUSY_INTERVAL_MS = 125;
-const DETECTION_MIN_DELAY_MS = 16;
-const DETECTOR_VALIDATION_INTERVAL_MS = 2000;
-const CROP_SAMPLE_FAST_MS = 90;
-const CROP_SAMPLE_NORMAL_MS = 160;
-const OCR_FIRST_READ_RETRY_MS = 80;
-const OCR_REPEAT_READ_RETRY_MS = 180;
-const OCR_MAX_CONCURRENCY = 4;
-const OVERLAY_ANGLE_SAMPLE_MS = 140;
-const MAX_OVERLAY_TILT_RAD = 0.35;
-const SCANNER_MAINTENANCE_INTERVAL_MS = 1000;
-const COOLDOWN_MAP_MAX_ENTRIES = 120;
-const MATCH_ALERT_LIMIT = 6;
-const TRACK_RESULT_HOLD_MS = 900;
-const POSSIBLE_MATCH_CONFIRMATION_READS = 2;
-const POSSIBLE_MATCH_CONFIRMATION_WINDOW_MS = 900;
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function clampPercentToThreshold(value: number, fallback: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return clampNumber(value / 100, min, max);
+}
 
 function getExpectedMinPlateChars(crop: HTMLCanvasElement): number {
   const aspect = crop.width / Math.max(1, crop.height);
@@ -133,8 +196,37 @@ function getExpectedMinPlateChars(crop: HTMLCanvasElement): number {
   return 3;
 }
 
-function clampNumber(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
+function countPlateChars(text: string): { letters: number; digits: number } {
+  return {
+    letters: (text.match(/[A-Z]/g) || []).length,
+    digits: (text.match(/[0-9]/g) || []).length,
+  };
+}
+
+function isPlausiblePlateCandidate(text: string, expectedMinChars: number, patternScore: number): boolean {
+  if (!text || text.length < 3) return false;
+
+  const { letters, digits } = countPlateChars(text);
+  if (letters === 0 || digits === 0) return false;
+
+  const hasEnoughLength = text.length >= expectedMinChars || (text.length >= 3 && patternScore >= 0.85);
+  if (!hasEnoughLength) return false;
+
+  if (text.length >= 5 && digits < 2) return false;
+  if (/^([A-Z0-9]{2,4})\1$/.test(text)) return false;
+
+  return true;
+}
+
+function canCommitFinalPlateOutcome(text: string): boolean {
+  const pattern = validateMalaysianPattern(text);
+  const { letters, digits } = countPlateChars(text);
+
+  if (!pattern.isValid || pattern.score < 0.55) return false;
+  if (letters === 0 || digits === 0) return false;
+  if (text.length >= 5 && digits < 2) return false;
+
+  return true;
 }
 
 function pruneCooldownMap(cooldowns: Map<string, number>, cooldownMs: number, now: number): void {
@@ -152,10 +244,6 @@ function pruneCooldownMap(cooldowns: Map<string, number>, cooldownMs: number, no
   entries.slice(0, COOLDOWN_MAP_MAX_ENTRIES).forEach(([plate, timestamp]) => {
     cooldowns.set(plate, timestamp);
   });
-}
-
-function enqueueMatchEntry(queue: MatchEntry[], entry: MatchEntry): MatchEntry[] {
-  return [...queue.filter(m => m.plate !== entry.plate), entry].slice(-MATCH_ALERT_LIMIT);
 }
 
 function resetTrackForNextPlate(track: ActiveTrack): void {
@@ -176,35 +264,7 @@ function resetTrackForNextPlate(track: ActiveTrack): void {
   delete track.matchType;
   delete track.matchedVehicle;
   delete track.possibleMatchVehicles;
-  delete track.possibleVerificationPlate;
-  delete track.possibleVerificationCount;
-  delete track.possibleVerificationStartedAt;
   delete track.scanEventId;
-}
-
-function prepareSilentPossibleConfirmation(track: ActiveTrack, plate: string, now: number): void {
-  const windowActive =
-    !!track.possibleVerificationStartedAt &&
-    now - track.possibleVerificationStartedAt <= POSSIBLE_MATCH_CONFIRMATION_WINDOW_MS;
-
-  track.possibleVerificationPlate = plate;
-  track.possibleVerificationCount = windowActive ? (track.possibleVerificationCount ?? 0) + 1 : 1;
-  track.possibleVerificationStartedAt = windowActive ? track.possibleVerificationStartedAt ?? now : now;
-
-  track.ocrState = 'COLLECTING';
-  track.cooldownActive = false;
-  track.votes.clear();
-  track.cropSamples = [];
-
-  delete track.cooldownStartedAt;
-  delete track.lastCropSampledAt;
-  delete track.lastOcrAttemptAt;
-  delete track.lastOcrCompletedAt;
-  delete track.stabilizedPlate;
-  delete track.stabilizedConfidence;
-  delete track.matchType;
-  delete track.matchedVehicle;
-  delete track.possibleMatchVehicles;
 }
 
 function drawRoundedRect(
@@ -230,43 +290,6 @@ function drawRoundedRect(
   ctx.quadraticCurveTo(x, y + height, x, y + height - r);
   ctx.lineTo(x, y + r);
   ctx.quadraticCurveTo(x, y, x + r, y);
-}
-
-function countPlateChars(text: string): { letters: number; digits: number } {
-  return {
-    letters: (text.match(/[A-Z]/g) || []).length,
-    digits: (text.match(/[0-9]/g) || []).length,
-  };
-}
-
-function isPlausiblePlateCandidate(
-  text: string,
-  expectedMinChars: number,
-  patternScore: number
-): boolean {
-  if (!text || text.length < 3) return false;
-
-  const { letters, digits } = countPlateChars(text);
-  if (letters === 0 || digits === 0) return false;
-
-  const hasEnoughLength = text.length >= expectedMinChars || (text.length >= 3 && patternScore >= 0.85);
-  if (!hasEnoughLength) return false;
-
-  if (text.length >= 5 && digits < 2) return false;
-  if (/^([A-Z0-9]{2,4})\1$/.test(text)) return false;
-
-  return true;
-}
-
-function canCommitFinalPlateOutcome(text: string): boolean {
-  const pattern = validateMalaysianPattern(text);
-  const { letters, digits } = countPlateChars(text);
-
-  if (!pattern.isValid || pattern.score < 0.55) return false;
-  if (letters === 0 || digits === 0) return false;
-  if (text.length >= 5 && digits < 2) return false;
-
-  return true;
 }
 
 function estimatePlateOverlayAngle(
@@ -339,7 +362,7 @@ function estimatePlateOverlayAngle(
     if (angle < -Math.PI / 2) angle += Math.PI;
     if (Math.abs(angle) > MAX_OVERLAY_TILT_RAD) angle = previousAngle;
 
-    return previousAngle * 0.60 + angle * 0.40;
+    return previousAngle * 0.6 + angle * 0.4;
   } catch {
     return previousAngle;
   }
@@ -349,7 +372,7 @@ function getCameraPreflightError(): string | null {
   if (typeof window === 'undefined') return null;
 
   if (!window.isSecureContext) {
-    return `Camera access is blocked on this address (${window.location.host}). Open the scanner over HTTPS, or use localhost on the same desktop/laptop. iPhone Safari and Android browsers require HTTPS for camera access.`;
+    return `Camera access is blocked on this address (${window.location.host}). Open the scanner over HTTPS, or use localhost.`;
   }
 
   if (!navigator.mediaDevices?.getUserMedia) {
@@ -359,242 +382,166 @@ function getCameraPreflightError(): string | null {
   return null;
 }
 
-function getResolutionConstraints(
-  preferredResolution: ScannerSettings['preferredResolution']
-): Pick<MediaTrackConstraints, 'width' | 'height'> {
-  if (preferredResolution === '1080p') {
-    return { width: { ideal: 1920 }, height: { ideal: 1080 } };
-  }
+function canRunMultiCameraOnCurrentDevice(): boolean {
+  if (typeof window === 'undefined') return false;
 
-  if (preferredResolution === '480p') {
-    return { width: { ideal: 854 }, height: { ideal: 480 } };
-  }
+  const userAgent = navigator.userAgent || '';
+  const phoneLikeUserAgent = /Mobi|Android|iPhone|iPod|Windows Phone/i.test(userAgent);
+  const narrowViewport = window.matchMedia('(max-width: 767px)').matches;
 
-  return { width: { ideal: 1280 }, height: { ideal: 720 } };
+  return !phoneLikeUserAgent && !narrowViewport;
 }
 
-function isSavedDeviceId(preferredCamera?: string): boolean {
-  return !!preferredCamera && !['environment', 'user', 'default', 'any'].includes(preferredCamera);
-}
+function mapVehicleToCase(vehicle: Vehicle): VehicleCase {
+  const normalizedPlate = cleanPlateNumber(vehicle.plate);
 
-function buildCameraConstraintCandidates(
-  settings: ScannerSettings,
-  requestedDeviceId?: string
-): Array<MediaTrackConstraints | boolean> {
-  const resolution = getResolutionConstraints(settings.preferredResolution);
-  const candidates: Array<MediaTrackConstraints | boolean> = [];
-  const seen = new Set<string>();
-  const add = (video: MediaTrackConstraints | boolean) => {
-    const key = typeof video === 'boolean' ? String(video) : JSON.stringify(video);
-    if (!seen.has(key)) {
-      seen.add(key);
-      candidates.push(video);
-    }
+  return {
+    id: vehicle.id,
+    plateNumber: normalizedPlate,
+    normalizedPlate,
+    customerName: vehicle.customerName,
+    customerReference: vehicle.customerId,
+    vehicleMake: vehicle.brand,
+    vehicleModel: vehicle.model,
+    vehicleColor: vehicle.colour,
+    vehicleYear: vehicle.year,
+    financeCompany: vehicle.financeCompany,
+    outstandingAmount: vehicle.outstandingAmount,
+    caseReference: vehicle.reference,
+    status: vehicle.status === 'ACTIVE' ? 'ACTIVE' : 'CLOSED',
+    notes: vehicle.remark,
+    createdAt: vehicle.createdDate,
+    updatedAt: vehicle.updatedDate,
   };
-
-  if (requestedDeviceId) {
-    add({ ...resolution, deviceId: { exact: requestedDeviceId } });
-    add({ ...resolution, deviceId: { ideal: requestedDeviceId } });
-  }
-
-  if (!requestedDeviceId && isSavedDeviceId(settings.preferredCamera)) {
-    add({ ...resolution, deviceId: { exact: settings.preferredCamera } });
-    add({ ...resolution, deviceId: { ideal: settings.preferredCamera } });
-  }
-
-  const preferredFacing = settings.preferredCamera === 'user' ? 'user' : 'environment';
-  const fallbackFacing = preferredFacing === 'environment' ? 'user' : 'environment';
-
-  add({ ...resolution, facingMode: { ideal: preferredFacing } });
-  add({ ...resolution, facingMode: { ideal: fallbackFacing } });
-  add({ ...resolution });
-  add(true);
-
-  return candidates;
-}
-
-async function enumerateVideoDevices(): Promise<MediaDeviceInfo[]> {
-  try {
-    const allDevices = await navigator.mediaDevices.enumerateDevices();
-    return allDevices.filter(d => d.kind === 'videoinput');
-  } catch {
-    return [];
-  }
-}
-
-async function openCompatibleCamera(
-  settings: ScannerSettings,
-  requestedDeviceId?: string
-): Promise<MediaStream> {
-  const candidates = buildCameraConstraintCandidates(settings, requestedDeviceId);
-  let lastError: any = null;
-
-  for (const video of candidates) {
-    try {
-      return await navigator.mediaDevices.getUserMedia({ audio: false, video });
-    } catch (err) {
-      lastError = err;
-      console.warn('[Scanner] Camera constraint failed, trying fallback:', err);
-    }
-  }
-
-  throw lastError || new Error('No compatible camera constraints found.');
-}
-
-async function attachCameraStream(video: HTMLVideoElement, stream: MediaStream): Promise<void> {
-  video.srcObject = stream;
-  video.muted = true;
-  video.playsInline = true;
-
-  if (video.readyState < HTMLMediaElement.HAVE_METADATA || video.videoWidth === 0) {
-    await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(() => resolve(), 2500);
-      const cleanup = () => {
-        window.clearTimeout(timeout);
-        video.removeEventListener('loadedmetadata', onReady);
-        video.removeEventListener('canplay', onReady);
-        video.removeEventListener('error', onError);
-      };
-      const onReady = () => {
-        cleanup();
-        resolve();
-      };
-      const onError = () => {
-        cleanup();
-        reject(new Error('Camera stream could not attach to video preview.'));
-      };
-
-      video.addEventListener('loadedmetadata', onReady, { once: true });
-      video.addEventListener('canplay', onReady, { once: true });
-      video.addEventListener('error', onError, { once: true });
-    });
-  }
-
-  await video.play();
-}
-
-async function applyCameraQualityOptimizations(track: MediaStreamTrack): Promise<void> {
-  if (typeof track.getCapabilities !== 'function' || typeof track.applyConstraints !== 'function') return;
-
-  try {
-    const caps = track.getCapabilities() as any;
-    const advanced: any[] = [];
-
-    if (Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
-      advanced.push({ focusMode: 'continuous' });
-    }
-    if (Array.isArray(caps.exposureMode) && caps.exposureMode.includes('continuous')) {
-      advanced.push({ exposureMode: 'continuous' });
-    }
-    if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes('continuous')) {
-      advanced.push({ whiteBalanceMode: 'continuous' });
-    }
-
-    if (advanced.length > 0) {
-      await track.applyConstraints({ advanced } as any);
-    }
-  } catch (err) {
-    console.warn('[Scanner] Camera quality constraints unavailable:', err);
-  }
-}
-
-function getCameraErrorMessage(err: any): string {
-  if (err?.name === 'NotAllowedError') {
-    return 'Camera permission denied. Allow camera access in browser settings and retry.';
-  }
-  if (err?.name === 'NotFoundError') {
-    return 'No camera device found. Connect a webcam or enable the built-in camera, then retry.';
-  }
-  if (err?.name === 'NotReadableError') {
-    return 'Camera is already in use by another application.';
-  }
-  if (err?.name === 'OverconstrainedError') {
-    return 'Requested camera settings are not supported by this device. Retrying with a different camera or lower resolution may help.';
-  }
-  if (err?.name === 'SecurityError') {
-    return 'Camera access requires HTTPS or localhost.';
-  }
-
-  return err?.message || 'Unable to access camera.';
 }
 
 export default function ScannerPage() {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const processingCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const trackerRef = useRef<PlateTracker>(new PlateTracker(20, 8));
-  const streamRef = useRef<MediaStream | null>(null);
+  const { t, language } = useLanguage();
+  const { vehicles, addHistoryLog, updateVehicle, settings } = useStorage();
+  const { role } = useAuth();
+
+  const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
+  const canvasRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
+  const slotRuntimesRef = useRef<Record<string, SlotScannerRuntime>>({});
+  const slotMetricsRef = useRef<Record<string, SlotMetrics>>({});
+  const activeStreamsRef = useRef<Record<string, MediaStream>>({});
+  const activeCameraSlotIdRef = useRef('camera-slot-1');
+  const cameraSlotsRef = useRef<CameraSlot[]>([{ id: 'camera-slot-1', deviceId: '' }]);
+  const availableCamerasRef = useRef<MediaDeviceInfo[]>([]);
+  const supportsMultiCameraScanRef = useRef(false);
   const runtimeStateRef = useRef<ANPRRuntimeState>('UNINITIALIZED');
+  const vehiclesRef = useRef(vehicles);
+  const addHistoryLogRef = useRef(addHistoryLog);
+  const soundEnabledRef = useRef(true);
+  const settingsRef = useRef<ScannerSettings>({ ...INITIAL_SETTINGS, debugMode: false });
+  const cooldownMap = useRef<Map<string, number>>(new Map());
+  const activeOcrCount = useRef(0);
+  const lastMetricsFlushTs = useRef(Date.now());
 
-  // Camera state
-  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
-  const [torchOn, setTorchOn] = useState(false);
-  const [torchSupported, setTorchSupported] = useState(false);
-  const [cameraError, setCameraError] = useState<string | null>(null);
-  const [cameraReady, setCameraReady] = useState(false);
-
-  // Scanner control
-  const isPausedRef = useRef<boolean>(false);
-  const [isPaused, setIsPaused] = useState(false);
-
-  // ANPR Production Runtime State Machine
+  const [availableCameras, setAvailableCameras] = useState<MediaDeviceInfo[]>([]);
+  const [cameraSlots, setCameraSlots] = useState<CameraSlot[]>([{ id: 'camera-slot-1', deviceId: '' }]);
+  const [activeCameraSlotId, setActiveCameraSlotId] = useState('camera-slot-1');
+  const [supportsMultiCameraScan, setSupportsMultiCameraScan] = useState(false);
+  const [previewSlotIds, setPreviewSlotIds] = useState<string[]>([]);
+  const [isCameraReady, setIsCameraReady] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
+  const [cameraError, setCameraError] = useState('');
+  const [soundEnabled, setSoundEnabled] = useState(true);
+  const [currentPlate, setCurrentPlate] = useState('READY');
+  const [lastDetectedSlotId, setLastDetectedSlotId] = useState('');
+  const [activeAlertMatch, setActiveAlertMatch] = useState<AlertMatch | null>(null);
+  const [liveDetections, setLiveDetections] = useState<SessionDetection[]>([]);
+  const [expandedDetectionId, setExpandedDetectionId] = useState<string | null>(null);
   const [runtimeState, setRuntimeState] = useState<ANPRRuntimeState>('UNINITIALIZED');
   const [benchmarkResult, setBenchmarkResult] = useState<AdmissionBenchmarkResult | null>(null);
   const [runtimeErrorMessage, setRuntimeErrorMessage] = useState<string | null>(null);
-
-  // Detector engine state
-  const [activeEngine, setActiveEngine] = useState<'LOCAL_ONNX' | 'CV_HEURISTIC'>('LOCAL_ONNX');
   const [detectorProvider, setDetectorProvider] = useState<ActiveExecutionProvider>('NONE');
   const [ocrProvider, setOcrProvider] = useState<ActiveOcrProvider>('NONE');
-  const [avgConfidence, setAvgConfidence] = useState<number>(0.85);
-
-  // Performance metrics
   const [camFps, setCamFps] = useState(0);
   const [detFps, setDetFps] = useState(0);
   const [platesVisible, setPlatesVisible] = useState(0);
   const [activeTracksCount, setActiveTracksCount] = useState(0);
-
-  // Active tracks for results tray
   const [tracksList, setTracksList] = useState<ActiveTrack[]>([]);
-  const [trayExpanded, setTrayExpanded] = useState(true);
 
-  // Match queue — all active matches, shown simultaneously
-  const [matchQueue, setMatchQueue] = useState<MatchEntry[]>([]);
-  const [viewingMatch, setViewingMatch] = useState<MatchEntry | null>(null);
+  const getSlotRuntime = useCallback((slotId: string): SlotScannerRuntime => {
+    if (!slotRuntimesRef.current[slotId]) {
+      slotRuntimesRef.current[slotId] = {
+        tracker: new PlateTracker(20, 8),
+        bestFrameSelector: new BestFrameSelector(),
+        processingCanvas: null,
+        lastMaintenanceTs: 0,
+      };
+    }
 
-  // Settings
-  const settingsRef = useRef<ScannerSettings>({ ...INITIAL_SETTINGS, debugMode: false });
-  const [isDebugMode, setIsDebugMode] = useState<boolean>(false);
+    return slotRuntimesRef.current[slotId];
+  }, []);
 
-  const camFrameCount = useRef(0);
-  const detFrameCount = useRef(0);
-  const lastFpsTs = useRef(Date.now());
-  const cooldownMap = useRef<Map<string, number>>(new Map());
-  const activeOcrCount = useRef(0);
-  const lastMaintenanceTs = useRef(0);
+  const ensureSlotMetrics = useCallback((slotId: string): SlotMetrics => {
+    if (!slotMetricsRef.current[slotId]) {
+      slotMetricsRef.current[slotId] = {
+        camFrames: 0,
+        detFrames: 0,
+        platesVisible: 0,
+        activeTracks: 0,
+        tracks: [],
+      };
+    }
+
+    return slotMetricsRef.current[slotId];
+  }, []);
+
+  const flushScannerMetrics = useCallback(() => {
+    const metrics = Object.values(slotMetricsRef.current);
+    const aggregate = metrics.reduce(
+      (acc, item) => {
+        acc.camFrames += item.camFrames;
+        acc.detFrames += item.detFrames;
+        acc.platesVisible += item.platesVisible;
+        acc.activeTracks += item.activeTracks;
+        acc.tracks.push(...item.tracks);
+        return acc;
+      },
+      { camFrames: 0, detFrames: 0, platesVisible: 0, activeTracks: 0, tracks: [] as ActiveTrack[] }
+    );
+
+    setCamFps(aggregate.camFrames);
+    setDetFps(aggregate.detFrames);
+    setPlatesVisible(aggregate.platesVisible);
+    setActiveTracksCount(aggregate.activeTracks);
+    setTracksList(aggregate.tracks);
+
+    Object.values(slotMetricsRef.current).forEach((item) => {
+      item.camFrames = 0;
+      item.detFrames = 0;
+    });
+  }, []);
 
   const resetLiveScanUi = useCallback(() => {
-    trackerRef.current.clear();
-    globalBestFrameSelector.resetAll();
-    camFrameCount.current = 0;
-    detFrameCount.current = 0;
+    Object.values(slotRuntimesRef.current).forEach((runtime) => {
+      runtime.tracker.clear();
+      runtime.bestFrameSelector.resetAll();
+      runtime.processingCanvas = null;
+      runtime.lastMaintenanceTs = 0;
+    });
+    slotMetricsRef.current = {};
     activeOcrCount.current = 0;
-    lastMaintenanceTs.current = 0;
+    lastMetricsFlushTs.current = Date.now();
     setTracksList([]);
     setPlatesVisible(0);
     setActiveTracksCount(0);
     setCamFps(0);
     setDetFps(0);
+    Object.values(canvasRefs.current).forEach((canvas) => {
+      const ctx = canvas?.getContext('2d');
+      if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    });
   }, []);
 
   const syncRuntimeStatus = useCallback(() => {
     const nextState = getANPRRuntimeState();
     runtimeStateRef.current = nextState;
-    setRuntimeState(prev => prev === nextState ? prev : nextState);
-
-    const nextBenchmark = getLatestBenchmarkResult();
-    setBenchmarkResult(prev => prev === nextBenchmark ? prev : nextBenchmark);
+    setRuntimeState((prev) => (prev === nextState ? prev : nextState));
+    setBenchmarkResult(getLatestBenchmarkResult());
     setRuntimeErrorMessage(getRuntimeErrorMessage());
     setDetectorProvider(getActiveDetectorProvider());
     setOcrProvider(getActivePpOcrProvider());
@@ -617,590 +564,834 @@ export default function ScannerPage() {
     }
   }, [syncRuntimeStatus]);
 
-  // ─── 1. Load Settings & Initialize Runtime ───────────────────────────
   useEffect(() => {
-    fetch('/api/settings')
-      .then(r => r.json())
-      .then(data => {
-        if (data.success && data.settings) {
-          settingsRef.current = { ...settingsRef.current, ...data.settings };
-          setIsDebugMode(!!data.settings.debugMode);
-          trackerRef.current.setLostTrackTimeout(data.settings.lostTrackTimeout ?? 20);
-          trackerRef.current.setMaxActiveTracks(data.settings.maxTracks ?? INITIAL_SETTINGS.maxTracks);
-        }
-      })
-      .catch(() => {});
-
-    startRuntimeInit();
-  }, [startRuntimeInit]);
+    vehiclesRef.current = vehicles;
+  }, [vehicles]);
 
   useEffect(() => {
-    const id = window.setInterval(syncRuntimeStatus, 1000);
-    return () => window.clearInterval(id);
-  }, [syncRuntimeStatus]);
-
-  // ─── 2. Initialise Camera ────────────────────────────────────────────────
-  const initCamera = useCallback(async (deviceId?: string) => {
-    setCameraError(null);
-    setCameraReady(false);
-
-    try {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop());
-        streamRef.current = null;
-      }
-      resetLiveScanUi();
-
-      const preflightError = getCameraPreflightError();
-      if (preflightError) {
-        setTorchOn(false);
-        setTorchSupported(false);
-        setCameraError(preflightError);
-        return;
-      }
-
-      const s = settingsRef.current;
-      const stream = await openCompatibleCamera(s, deviceId);
-      streamRef.current = stream;
-
-      if (videoRef.current) {
-        await attachCameraStream(videoRef.current, stream);
-      }
-
-      const videoDevs = await enumerateVideoDevices();
-      setDevices(videoDevs);
-
-      const track = stream.getVideoTracks()[0];
-      if (track) {
-        await applyCameraQualityOptimizations(track);
-
-        const trackSettings = typeof track.getSettings === 'function' ? track.getSettings() : {};
-        if (trackSettings.deviceId) {
-          setSelectedDeviceId(trackSettings.deviceId);
-        } else if (deviceId) {
-          setSelectedDeviceId(deviceId);
-        }
-
-        const caps = typeof track.getCapabilities === 'function' ? track.getCapabilities() as any : {};
-        setTorchSupported(!!caps?.torch);
-      }
-
-      setCameraReady(true);
-    } catch (err: any) {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop());
-        streamRef.current = null;
-      }
-      resetLiveScanUi();
-      setTorchOn(false);
-      setTorchSupported(false);
-      setCameraError(getCameraErrorMessage(err));
-    }
-  }, [resetLiveScanUi]);
+    cameraSlotsRef.current = cameraSlots;
+  }, [cameraSlots]);
 
   useEffect(() => {
-    initCamera();
-    return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop());
+    availableCamerasRef.current = availableCameras;
+  }, [availableCameras]);
+
+  useEffect(() => {
+    activeCameraSlotIdRef.current = activeCameraSlotId;
+  }, [activeCameraSlotId]);
+
+  useEffect(() => {
+    supportsMultiCameraScanRef.current = supportsMultiCameraScan;
+  }, [supportsMultiCameraScan]);
+
+  useEffect(() => {
+    const updateCapability = () => {
+      const nextSupportsMultiCamera = canRunMultiCameraOnCurrentDevice();
+      supportsMultiCameraScanRef.current = nextSupportsMultiCamera;
+      setSupportsMultiCameraScan(nextSupportsMultiCamera);
+
+      if (!nextSupportsMultiCamera) {
+        setCameraSlots((slots) => {
+          const selectedSlot = slots.find((slot) => slot.id === activeCameraSlotIdRef.current) || slots[0];
+          return selectedSlot ? [selectedSlot] : slots;
+        });
+        setPreviewSlotIds((ids) => ids.filter((id) => id === activeCameraSlotIdRef.current));
       }
     };
-  }, [initCamera]);
 
-  // ─── 3. Torch Toggle ────────────────────────────────────────────────────
-  const toggleTorch = async () => {
-    const track = streamRef.current?.getVideoTracks()[0];
-    if (!track) return;
-    try {
-      await track.applyConstraints({ advanced: [{ torch: !torchOn } as any] });
-      setTorchOn(v => !v);
-    } catch {}
-  };
+    const id = window.setTimeout(updateCapability, 0);
+    window.addEventListener('resize', updateCapability);
+    window.addEventListener('orientationchange', updateCapability);
 
-  // ─── 4. Camera Switch ────────────────────────────────────────────────────
-  const handleSwitchCamera = () => {
-    if (devices.length < 2) return;
-    const idx = devices.findIndex(d => d.deviceId === selectedDeviceId);
-    const next = devices[(idx + 1) % devices.length];
-    setSelectedDeviceId(next.deviceId);
-    initCamera(next.deviceId);
-  };
+    return () => {
+      window.clearTimeout(id);
+      window.removeEventListener('resize', updateCapability);
+      window.removeEventListener('orientationchange', updateCapability);
+    };
+  }, []);
 
-  // ─── 5. Pause / Resume ──────────────────────────────────────────────────
-  const togglePause = () => {
-    isPausedRef.current = !isPausedRef.current;
-    setIsPaused(isPausedRef.current);
-  };
+  useEffect(() => {
+    addHistoryLogRef.current = addHistoryLog;
+  }, [addHistoryLog]);
 
-  // ─── 6. Per-Track Database Match ─────────────────────────────────────────
-  const runDatabaseMatch = useCallback(async (
-    track: ActiveTrack,
-    plate: string,
-    confidence: number,
-    options: { commitNoCase?: boolean } = {}
-  ) => {
-    const commitNoCase = options.commitNoCase ?? true;
-    const cooldownMs = settingsRef.current.duplicateCooldown * 1000;
-    const now = Date.now();
-    const lastSearch = cooldownMap.current.get(plate) ?? 0;
-    const trackSearchThrottleMs = commitNoCase ? 0 : 1000;
+  useEffect(() => {
+    soundEnabledRef.current = soundEnabled;
+  }, [soundEnabled]);
 
-    if (commitNoCase && now - lastSearch < cooldownMs) {
-      track.ocrState = 'COOLDOWN';
-      track.cooldownActive = true;
-      track.cooldownStartedAt = now;
-      return;
+  useEffect(() => {
+    settingsRef.current = {
+      ...settingsRef.current,
+      soundEnabled: soundEnabled && settings.soundAlerts,
+      detectionThreshold: clampPercentToThreshold(
+        settings.detectionConfidence,
+        INITIAL_SETTINGS.detectionThreshold,
+        0.25,
+        0.65
+      ),
+      recognitionThreshold: clampPercentToThreshold(
+        settings.ocrConfidence,
+        INITIAL_SETTINGS.recognitionThreshold,
+        0.35,
+        0.7
+      ),
+    };
+  }, [settings, soundEnabled]);
+
+  useEffect(() => {
+    const initTimer = window.setTimeout(() => {
+      void startRuntimeInit();
+    }, 0);
+    const id = window.setInterval(syncRuntimeStatus, 1000);
+    return () => {
+      window.clearTimeout(initTimer);
+      window.clearInterval(id);
+    };
+  }, [startRuntimeInit, syncRuntimeStatus]);
+
+  useEffect(() => {
+    const restoreTimer = window.setTimeout(() => {
+      try {
+        const storedDetections = localStorage.getItem(RECENT_DETECTIONS_STORAGE_KEY);
+        if (storedDetections) {
+          const parsedDetections = JSON.parse(storedDetections) as SessionDetection[];
+          setLiveDetections(parsedDetections.slice(0, 8));
+          if (parsedDetections[0]) {
+            setCurrentPlate(parsedDetections[0].plate);
+            setLastDetectedSlotId(parsedDetections[0].cameraId);
+          }
+        }
+      } catch {
+        localStorage.removeItem(RECENT_DETECTIONS_STORAGE_KEY);
+      }
+
+      void refreshCameraList();
+    }, 0);
+
+    return () => {
+      window.clearTimeout(restoreTimer);
+      stopCamera();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isCameraReady) return;
+    const resumeScanning = isScanning;
+    window.setTimeout(() => {
+      void startVisibleCameras({ resumeScanning });
+    }, 0);
+  }, [cameraSlots.length]);
+
+  async function refreshCameraList() {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      setCameraError('Camera devices are not available in this browser.');
+      return [] as MediaDeviceInfo[];
     }
-    if (trackSearchThrottleMs > 0 && track.lastSearchedAt && now - track.lastSearchedAt < trackSearchThrottleMs) return;
-    track.lastSearchedAt = now;
-
-    track.ocrState = 'DB_CHECKING';
 
     try {
-      const searchRes = await fetch('/api/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ plateNumber: plate, source: 'CAMERA', confidence }),
-      }).then(r => r.json());
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter((device) => device.kind === 'videoinput');
+      setAvailableCameras(videoDevices);
+      setCameraSlots((slots) =>
+        slots.map((slot, index) => ({
+          ...slot,
+          deviceId: slot.deviceId || videoDevices[index]?.deviceId || videoDevices[0]?.deviceId || '',
+        }))
+      );
+      setCameraError('');
+      return videoDevices;
+    } catch {
+      setCameraError('Unable to read camera list. Please allow camera access.');
+      return [] as MediaDeviceInfo[];
+    }
+  }
 
-      if (!searchRes.success) {
+  function getCameraSlotLabel(slot: CameraSlot | undefined, index: number) {
+    if (!slot) return language === 'BM' ? 'Kamera Laptop' : 'Laptop Camera';
+    const device = availableCameras.find((cameraDevice) => cameraDevice.deviceId === slot.deviceId);
+    return device?.label || (index === 0 ? (language === 'BM' ? 'Kamera Laptop' : 'Laptop Camera') : `Camera ${index + 1}`);
+  }
+
+  function stopCamera(options: { preserveScanningState?: boolean } = {}) {
+    Object.values(activeStreamsRef.current).forEach((stream) => {
+      stream.getTracks().forEach((track) => track.stop());
+    });
+    activeStreamsRef.current = {};
+    setPreviewSlotIds([]);
+    setIsCameraReady(false);
+    if (!options.preserveScanningState) {
+      setIsScanning(false);
+    }
+    resetLiveScanUi();
+  }
+
+  async function startCameraForSlot(slot: CameraSlot) {
+    const preflightError = getCameraPreflightError();
+    if (preflightError) {
+      setCameraError(preflightError);
+      return false;
+    }
+
+    try {
+      const streamKey = slot.deviceId || 'default-camera';
+      let stream = activeStreamsRef.current[streamKey];
+
+      if (!stream) {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: slot.deviceId
+            ? { deviceId: { exact: slot.deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+            : { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        });
+        activeStreamsRef.current[streamKey] = stream;
+      }
+
+      const video = videoRefs.current[slot.id];
+      if (video) {
+        video.muted = true;
+        video.playsInline = true;
+        video.setAttribute('playsinline', 'true');
+        video.setAttribute('webkit-playsinline', 'true');
+        video.srcObject = stream;
+        await video.play().catch(() => undefined);
+      }
+
+      setPreviewSlotIds((ids) => (ids.includes(slot.id) ? ids : [...ids, slot.id]));
+      setCameraError('');
+      return true;
+    } catch {
+      setCameraError('Unable to start camera. Please allow camera permission and try again.');
+      return false;
+    }
+  }
+
+  async function startVisibleCameras(options: { resumeScanning?: boolean } = {}) {
+    const resumeScanning = options.resumeScanning ?? false;
+    stopCamera({ preserveScanningState: resumeScanning });
+    const devices = await refreshCameraList();
+    const resolvedSlots =
+      cameraSlots.length > 0
+        ? cameraSlots.map((slot, index) => ({
+            ...slot,
+            deviceId: slot.deviceId || devices[index]?.deviceId || devices[0]?.deviceId || '',
+          }))
+        : [{ id: 'camera-slot-1', deviceId: devices[0]?.deviceId || '' }];
+    const slots = supportsMultiCameraScanRef.current
+      ? resolvedSlots
+      : [resolvedSlots.find((slot) => slot.id === activeCameraSlotIdRef.current) || resolvedSlots[0]];
+
+    setCameraSlots(slots);
+    const startedResults = await Promise.all(slots.map((slot) => startCameraForSlot(slot)));
+    const started = startedResults.some(Boolean);
+    setIsCameraReady(started);
+    if (started && resumeScanning) {
+      setCurrentPlate('SCANNING');
+      setIsScanning(true);
+    }
+    return started;
+  }
+
+  const handleUseCamera = async (slot: CameraSlot, index: number) => {
+    const devices = await refreshCameraList();
+    const resolvedSlot = {
+      ...slot,
+      deviceId: slot.deviceId || devices[index]?.deviceId || devices[0]?.deviceId || '',
+    };
+    setCameraSlots((slots) => slots.map((item) => (item.id === slot.id ? resolvedSlot : item)));
+    handleSelectActiveSlot(slot.id);
+    const started = await startCameraForSlot(resolvedSlot);
+    if (started) setIsCameraReady(true);
+  };
+
+  const handleSelectActiveSlot = (slotId: string) => {
+    setActiveCameraSlotId(slotId);
+    if (isScanning) {
+      setLastDetectedSlotId(slotId);
+      setCurrentPlate((plate) => (plate === 'READY' || plate === 'PAUSED' ? 'SCANNING' : plate));
+    }
+  };
+
+  const handleCameraSlotDeviceChange = (slotId: string, deviceId: string) => {
+    setCameraSlots((slots) => slots.map((slot) => (slot.id === slotId ? { ...slot, deviceId } : slot)));
+    setPreviewSlotIds((ids) => ids.filter((id) => id !== slotId));
+    handleSelectActiveSlot(slotId);
+    if (isScanning) {
+      setIsScanning(false);
+      resetLiveScanUi();
+      setCurrentPlate('READY');
+    }
+  };
+
+  const handleStartScanning = async () => {
+    const started = await startVisibleCameras();
+    if (started) {
+      if (!isRuntimeScanningReady(runtimeStateRef.current)) {
+        void startRuntimeInit();
+      }
+      resetLiveScanUi();
+      setCurrentPlate('SCANNING');
+      setIsScanning(true);
+    }
+  };
+
+  const handlePauseScanning = () => {
+    setIsScanning(false);
+    resetLiveScanUi();
+    setCurrentPlate('PAUSED');
+  };
+
+  const handleAddCamera = async () => {
+    if (!supportsMultiCameraScanRef.current) return;
+
+    const devices = await refreshCameraList();
+    setCameraSlots((slots) => {
+      if (slots.length >= 4) return slots;
+      const nextIndex = slots.length;
+      const nextDeviceId = devices[nextIndex]?.deviceId || devices[0]?.deviceId || slots[0]?.deviceId || '';
+      return [...slots, { id: `camera-slot-${Date.now()}`, deviceId: nextDeviceId }];
+    });
+  };
+
+  const handleRemoveCamera = (slotId: string) => {
+    setCameraSlots((slots) => {
+      if (slots.length <= 1) return slots;
+      const nextSlots = slots.filter((slot) => slot.id !== slotId);
+      if (activeCameraSlotId === slotId) {
+        setActiveCameraSlotId(nextSlots[0]?.id || 'camera-slot-1');
+      }
+      setPreviewSlotIds((ids) => ids.filter((id) => id !== slotId));
+      return nextSlots;
+    });
+  };
+
+  function playAlertChime() {
+    if (!soundEnabledRef.current) return;
+    try {
+      const audioWindow = window as AudioWindow;
+      const AudioCtor = audioWindow.AudioContext || audioWindow.webkitAudioContext;
+      if (!AudioCtor) return;
+      const audioCtx = new AudioCtor();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(1760, audioCtx.currentTime + 0.3);
+      gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.3);
+    } catch {
+      // Silent fallback when audio playback is blocked by the browser.
+    }
+  }
+
+  const getCameraSlotLabelFromRefs = useCallback(
+    (slotId: string) => {
+      const slots = cameraSlotsRef.current;
+      const slotIndex = slots.findIndex((slot) => slot.id === slotId);
+      const slot = slots[slotIndex] || slots[0];
+      if (!slot) return language === 'BM' ? 'Kamera Laptop' : 'Laptop Camera';
+      const device = availableCamerasRef.current.find((cameraDevice) => cameraDevice.deviceId === slot.deviceId);
+      return (
+        device?.label ||
+        (slotIndex <= 0 ? (language === 'BM' ? 'Kamera Laptop' : 'Laptop Camera') : `Camera ${slotIndex + 1}`)
+      );
+    },
+    [language]
+  );
+
+  const runDatabaseMatch = useCallback(
+    async (
+      track: ActiveTrack,
+      plate: string,
+      confidence: number,
+      slotId: string,
+      options: { commitNoCase?: boolean } = {}
+    ) => {
+      const commitNoCase = options.commitNoCase ?? true;
+      const normalizedPlate = cleanPlateNumber(plate);
+      const cooldownMs = settingsRef.current.duplicateCooldown * 1000;
+      const now = Date.now();
+      const lastSearch = cooldownMap.current.get(normalizedPlate) ?? 0;
+      const trackSearchThrottleMs = commitNoCase ? 0 : 1000;
+
+      if (commitNoCase && now - lastSearch < cooldownMs) {
+        track.ocrState = 'COOLDOWN';
+        track.cooldownActive = true;
+        track.cooldownStartedAt = now;
+        return;
+      }
+
+      if (trackSearchThrottleMs > 0 && track.lastSearchedAt && now - track.lastSearchedAt < trackSearchThrottleMs) {
+        return;
+      }
+
+      track.lastSearchedAt = now;
+      track.ocrState = 'DB_CHECKING';
+
+      const vehicleCases = vehiclesRef.current.map(mapVehicleToCase);
+      const evaluation = evaluateDatabaseMatch(
+        normalizedPlate,
+        confidence,
+        vehicleCases,
+        undefined,
+        Math.min(settingsRef.current.recognitionThreshold, 0.6)
+      );
+      const matchedVehicle =
+        evaluation.matchedVehicle ? vehiclesRef.current.find((vehicle) => vehicle.id === evaluation.matchedVehicle?.id) || null : null;
+      const possibleVehicles = evaluation.possibleMatches
+        .map((possibleVehicle) => vehiclesRef.current.find((vehicle) => vehicle.id === possibleVehicle.id) || null)
+        .filter((vehicle): vehicle is Vehicle => Boolean(vehicle));
+      const resolvedMatchType =
+        evaluation.matchType === 'EXACT' && matchedVehicle
+          ? 'EXACT'
+          : evaluation.matchType === 'POSSIBLE' && possibleVehicles.length > 0
+          ? 'POSSIBLE'
+          : 'NONE';
+
+      if (!commitNoCase && resolvedMatchType === 'NONE') {
         track.ocrState = 'CONSENSUS_BUILDING';
         return;
       }
 
-      if (!commitNoCase && searchRes.matchType !== 'EXACT' && searchRes.matchType !== 'POSSIBLE') {
-        track.ocrState = 'CONSENSUS_BUILDING';
-        return;
-      }
+      cooldownMap.current.set(normalizedPlate, now);
 
-      const possibleWindowActive =
-        !!track.possibleVerificationStartedAt &&
-        now - track.possibleVerificationStartedAt <= POSSIBLE_MATCH_CONFIRMATION_WINDOW_MS;
-      const possibleReadCount = possibleWindowActive ? track.possibleVerificationCount ?? 0 : 0;
+      const timestamp = new Date();
+      const scanCameraName = getCameraSlotLabelFromRefs(slotId);
+      const scanLocation = SCAN_LOCATIONS[Math.floor(Math.random() * SCAN_LOCATIONS.length)];
+      const confidencePercent = Number((confidence * 100).toFixed(1));
+      const detectionId = `det-${timestamp.getTime()}-${Math.floor(Math.random() * 1000)}`;
+      const newDetection: SessionDetection = {
+        id: detectionId,
+        plate: normalizedPlate,
+        confidence: confidencePercent,
+        matched: resolvedMatchType === 'EXACT',
+        vehicleId: matchedVehicle?.id,
+        timestamp: timestamp.toLocaleTimeString('en-GB'),
+        cameraId: slotId || 'laptop-camera',
+        cameraName: scanCameraName,
+        name: scanLocation.name,
+        gps: scanLocation.gps,
+        matchType: resolvedMatchType,
+        possibleVehicleIds: possibleVehicles.map((vehicle) => vehicle.id),
+      };
 
-      if (searchRes.matchType === 'POSSIBLE' && possibleReadCount < POSSIBLE_MATCH_CONFIRMATION_READS - 1) {
-        prepareSilentPossibleConfirmation(track, plate, now);
-        globalBestFrameSelector.clearTrack(track.trackNumber);
-        track.lastSearchedAt = 0;
-        return;
-      }
+      setCurrentPlate(normalizedPlate);
+      setLastDetectedSlotId(slotId);
+      setLiveDetections((prevStream) => {
+        const nextStream = [newDetection, ...prevStream.slice(0, 7)];
+        localStorage.setItem(RECENT_DETECTIONS_STORAGE_KEY, JSON.stringify(nextStream));
+        return nextStream;
+      });
 
-      const resolvedMatchType = searchRes.matchType === 'EXACT'
-        ? 'EXACT'
-        : 'NONE';
-
-      cooldownMap.current.set(plate, now);
-
-      const scanRes = await fetch('/api/scans', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          detectedPlate: plate,
-          normalizedPlate: plate,
-          confidence,
-          matchType: resolvedMatchType,
-          matchedVehicleId: resolvedMatchType === 'EXACT' ? searchRes.matchedVehicle?.id ?? undefined : undefined,
-          source: 'CAMERA',
-          trackId: track.trackId,
-          frameCount: track.framesSeen,
-          firstSeenAt: new Date(Date.now() - track.framesSeen * 33).toISOString(),
-        }),
-      }).then(r => r.json());
+      addHistoryLogRef.current({
+        type: 'DETECTION',
+        action:
+          resolvedMatchType === 'EXACT'
+            ? `Tanda Tindakan (Pengimbas): ${normalizedPlate}`
+            : resolvedMatchType === 'POSSIBLE'
+            ? `Possible Match (Pengimbas): ${normalizedPlate}`
+            : `Live Scan: ${normalizedPlate}`,
+        plate: normalizedPlate,
+        details:
+          resolvedMatchType === 'EXACT' && matchedVehicle
+            ? `AI Confidence: ${confidencePercent}% - Tanda Tindakan: ${matchedVehicle.brand} ${matchedVehicle.model} - Location: ${scanLocation.name} (${scanLocation.gps})`
+            : resolvedMatchType === 'POSSIBLE'
+            ? `AI Confidence: ${confidencePercent}% - Possible Match: ${possibleVehicles
+                .map((vehicle) => vehicle.plate)
+                .join(', ')} - Location: ${scanLocation.name} (${scanLocation.gps})`
+            : `AI Confidence: ${confidencePercent}% - No Match Found - Location: ${scanLocation.name} (${scanLocation.gps})`,
+        note:
+          resolvedMatchType === 'EXACT' && matchedVehicle
+            ? `Match Found: ${matchedVehicle.brand} ${matchedVehicle.model} via ${scanCameraName} at ${scanLocation.name}`
+            : resolvedMatchType === 'POSSIBLE'
+            ? `Possible match from ${scanCameraName}: ${possibleVehicles.map((vehicle) => vehicle.plate).join(', ')}`
+            : `No match from ${scanCameraName} at ${scanLocation.name}`,
+        userRole: role,
+        statusMatch: resolvedMatchType,
+      });
 
       track.matchType = resolvedMatchType;
-      track.matchedVehicle = resolvedMatchType === 'EXACT' ? searchRes.matchedVehicle ?? undefined : undefined;
-      track.possibleMatchVehicles = [];
-      track.ocrState = track.matchType === 'EXACT' ? 'MATCHED' : 'NO CASE';
-      delete track.possibleVerificationPlate;
-      delete track.possibleVerificationCount;
-      delete track.possibleVerificationStartedAt;
+      track.matchedVehicle = matchedVehicle ?? undefined;
+      track.possibleMatchVehicles = possibleVehicles;
+      track.ocrState =
+        resolvedMatchType === 'EXACT' ? 'MATCHED' : resolvedMatchType === 'POSSIBLE' ? 'POSSIBLE MATCH' : 'NO CASE';
+      track.scanEventId = detectionId;
 
-      if (resolvedMatchType === 'EXACT') {
-        if (settingsRef.current.soundEnabled) playAlertSound('EXACT_MATCH');
-        if (settingsRef.current.vibrationEnabled) triggerVibration([200, 100, 200, 100]);
-
-        const entry: MatchEntry = {
-          type: 'EXACT',
-          plate,
-          trackId: track.trackId,
-          vehicle: searchRes.matchedVehicle,
-          possibleMatches: [],
-          confidence,
-          scanId: scanRes.scanEvent?.id,
-          timestamp: now,
-          dismissed: false,
-        };
-        setMatchQueue(q => enqueueMatchEntry(q, entry));
+      if (resolvedMatchType === 'EXACT' && matchedVehicle) {
+        setActiveAlertMatch({ vehicle: matchedVehicle, cameraName: scanCameraName, cameraId: slotId });
+        playAlertChime();
       }
 
       track.ocrState = 'COOLDOWN';
       track.cooldownActive = true;
       track.cooldownStartedAt = Date.now();
-      track.scanEventId = scanRes.scanEvent?.id;
-    } catch (err) {
-      console.warn('[Scanner] DB match error:', err);
-      track.ocrState = 'COLLECTING';
-    }
-  }, []);
+    },
+    [getCameraSlotLabelFromRefs, role]
+  );
 
-  // ─── 7. Main ANPR Pipeline Loop ──────────────────────────────────────────
   useEffect(() => {
-    if (!cameraReady) return;
+    if (!isCameraReady || !isScanning) return;
 
-    let animId: number;
-    let detectionTimeout: ReturnType<typeof setTimeout> | undefined;
     let stopped = false;
-    let detTs = Date.now();
-    let detCount = 0;
-    let lastVideoTime = -1;
-    let lastDetectorValidationAt = 0;
+    const slotsToScan = (supportsMultiCameraScan
+      ? cameraSlots
+      : cameraSlots.filter((slot) => slot.id === activeCameraSlotIdRef.current)
+    ).filter((slot) => previewSlotIds.includes(slot.id) && videoRefs.current[slot.id]);
 
-    const scheduleDetection = (delay = 100) => {
-      if (stopped) return;
-      detectionTimeout = setTimeout(runDetection, delay);
-    };
+    if (slotsToScan.length === 0) return;
 
-    const runDetection = async () => {
-      if (stopped) return;
+    const flushInterval = window.setInterval(flushScannerMetrics, 1000);
+    const cleanupRunners = slotsToScan.map((slot) => {
+      const slotId = slot.id;
+      const runtime = getSlotRuntime(slotId);
+      const metrics = ensureSlotMetrics(slotId);
+      let animId: number;
+      let detectionTimeout: ReturnType<typeof setTimeout> | undefined;
+      let lastVideoTime = -1;
+      let lastDetectorValidationAt = 0;
 
-      if (!videoRef.current) {
-        scheduleDetection(150);
-        return;
-      }
+      const scheduleDetection = (delay = 100) => {
+        if (stopped) return;
+        detectionTimeout = setTimeout(runDetection, delay);
+      };
 
-      if (isPausedRef.current || !isRuntimeScanningReady(runtimeStateRef.current)) {
-        scheduleDetection(250);
-        return;
-      }
+      const runDetection = async () => {
+        if (stopped) return;
 
-      const video = videoRef.current;
+        const video = videoRefs.current[slotId];
 
-      if (video.readyState < 2 || video.videoWidth === 0) {
-        scheduleDetection(150);
-        return;
-      }
-
-      if (!processingCanvasRef.current) {
-        processingCanvasRef.current = document.createElement('canvas');
-      }
-
-      const processingCanvas = processingCanvasRef.current;
-      if (processingCanvas.width !== video.videoWidth || processingCanvas.height !== video.videoHeight) {
-        processingCanvas.width = video.videoWidth;
-        processingCanvas.height = video.videoHeight;
-      }
-
-      const processingCtx = processingCanvas.getContext('2d', { willReadFrequently: true });
-      if (!processingCtx) {
-        scheduleDetection(150);
-        return;
-      }
-
-      const detectionStartedAt = performance.now();
-      processingCtx.drawImage(video, 0, 0, processingCanvas.width, processingCanvas.height);
-
-      const s = settingsRef.current;
-
-      // ── Step 1: Malaysian Plate Detector ──
-      let detectedPlates: Awaited<ReturnType<typeof detectMalaysianPlates>> = [];
-      try {
-        detectedPlates = await detectMalaysianPlates(processingCanvas, {
-          minConfidence: s.detectionThreshold,
-          enginePreference: s.detectorEngine,
-          developerMode: s.debugMode,
-        });
-      } catch (err) {
-        console.warn('[Scanner] Detector frame failed:', err);
-      }
-
-      if (detectedPlates.length > 0) {
-        setActiveEngine(detectedPlates[0].sourceEngine);
-        const avgConf = detectedPlates.reduce((sum, p) => sum + p.confidence, 0) / detectedPlates.length;
-        setAvgConfidence(avgConf);
-      } else {
-        const now = Date.now();
-        if (now - lastDetectorValidationAt > DETECTOR_VALIDATION_INTERVAL_MS) {
-          lastDetectorValidationAt = now;
-          const val = await validateDetector();
-          if (val.valid) setActiveEngine('LOCAL_ONNX');
-        }
-      }
-
-      const bboxList = detectedPlates.map(p => ({
-        x: p.bbox.x,
-        y: p.bbox.y,
-        width: p.bbox.width,
-        height: p.bbox.height,
-        confidence: p.confidence,
-      }));
-
-      // ── Step 2: Multi-Object ByteTrack ──
-      const allTracks = trackerRef.current.updateTracks(bboxList);
-      const confirmedTracks = trackerRef.current.getActiveTracks(true); // Only confirmed tracks
-      const displayTracks = s.debugMode ? allTracks : confirmedTracks;
-      const loopNow = Date.now();
-
-      confirmedTracks.forEach(track => {
-        if (track.cooldownActive && !track.cooldownStartedAt) {
-          track.cooldownStartedAt = loopNow;
-        }
-
-        if (
-          track.cooldownActive &&
-          track.cooldownStartedAt &&
-          loopNow - track.cooldownStartedAt >= TRACK_RESULT_HOLD_MS
-        ) {
-          resetTrackForNextPlate(track);
-          globalBestFrameSelector.clearTrack(track.trackNumber);
-        }
-      });
-
-      if (loopNow - lastMaintenanceTs.current >= SCANNER_MAINTENANCE_INTERVAL_MS) {
-        const activeTrackNumbers = new Set(allTracks.map(track => track.trackNumber));
-        globalBestFrameSelector.clearExcept(activeTrackNumbers);
-        globalBestFrameSelector.pruneStale(undefined, activeTrackNumbers, loopNow);
-        pruneCooldownMap(cooldownMap.current, s.duplicateCooldown * 1000, loopNow);
-        lastMaintenanceTs.current = loopNow;
-      }
-
-      setPlatesVisible(bboxList.length);
-      setActiveTracksCount(confirmedTracks.length); // Update metric to show confirmed count
-      setTracksList([...displayTracks]); // UI List
-
-      // ── Step 3: Best Frame Selection (Only on Confirmed Tracks) ──
-      const cropSampleNow = loopNow;
-      confirmedTracks.forEach(track => {
-        if (!track.lastOverlayAngleAt || cropSampleNow - track.lastOverlayAngleAt >= OVERLAY_ANGLE_SAMPLE_MS) {
-          track.overlayAngle = estimatePlateOverlayAngle(processingCanvas, track.bbox, track.overlayAngle ?? 0);
-          track.lastOverlayAngleAt = cropSampleNow;
-        }
-
-        if (track.ocrState === 'COOLDOWN' || track.ocrState === 'MATCHED') return;
-        const existingCrop = globalBestFrameSelector.getBestCrop(track.trackNumber);
-        const sampleInterval = track.bbox.confidence >= 0.70 ? CROP_SAMPLE_FAST_MS : CROP_SAMPLE_NORMAL_MS;
-        if (existingCrop && track.lastCropSampledAt && cropSampleNow - track.lastCropSampledAt < sampleInterval) {
+        if (!video) {
+          scheduleDetection(150);
           return;
         }
 
-        const cropCanvas = cropCanvasRegionFast(processingCanvas, track.bbox);
-        globalBestFrameSelector.addCropCandidate(track.trackNumber, cropCanvas, track.bbox);
-        track.lastCropSampledAt = cropSampleNow;
-      });
+        if (!isRuntimeScanningReady(runtimeStateRef.current)) {
+          scheduleDetection(250);
+          return;
+        }
 
-      // ── Step 4: OCR Priority Queue (Async Decoupled) ──
-      processOcrQueue(confirmedTracks, processingCanvas, s);
+        if (video.readyState < 2 || video.videoWidth === 0) {
+          scheduleDetection(150);
+          return;
+        }
 
-      detCount++;
-      const now = Date.now();
-      if (now - detTs >= 1000) {
-        setDetFps(detCount);
-        detCount = 0;
-        detTs = now;
-      }
+        if (!runtime.processingCanvas) {
+          runtime.processingCanvas = document.createElement('canvas');
+        }
 
-      const targetInterval = activeOcrCount.current > 0 ? DETECTION_BUSY_INTERVAL_MS : DETECTION_TARGET_INTERVAL_MS;
-      const nextDelay = Math.max(DETECTION_MIN_DELAY_MS, Math.round(targetInterval - (performance.now() - detectionStartedAt)));
-      scheduleDetection(nextDelay);
-    };
+        const processingCanvas = runtime.processingCanvas;
+        if (processingCanvas.width !== video.videoWidth || processingCanvas.height !== video.videoHeight) {
+          processingCanvas.width = video.videoWidth;
+          processingCanvas.height = video.videoHeight;
+        }
 
-    const processOcrQueue = async (confirmedTracks: ActiveTrack[], canvas: HTMLCanvasElement, s: ScannerSettings) => {
-      if (!isPpOcrReady()) {
-        confirmedTracks.forEach(track => {
-          if (!track.cooldownActive && track.ocrState !== 'MATCHED') {
-            track.ocrState = 'COLLECTING';
+        const processingCtx = processingCanvas.getContext('2d', { willReadFrequently: true });
+        if (!processingCtx) {
+          scheduleDetection(150);
+          return;
+        }
+
+        const detectionStartedAt = performance.now();
+        processingCtx.drawImage(video, 0, 0, processingCanvas.width, processingCanvas.height);
+
+        const scannerSettings = settingsRef.current;
+        let detectedPlates: Awaited<ReturnType<typeof detectMalaysianPlates>> = [];
+
+        try {
+          detectedPlates = await detectMalaysianPlates(processingCanvas, {
+            minConfidence: scannerSettings.detectionThreshold,
+            enginePreference: scannerSettings.detectorEngine,
+            developerMode: scannerSettings.debugMode,
+          });
+        } catch (err) {
+          console.warn(`[Scanner:${slotId}] Detector frame failed:`, err);
+        }
+
+        if (detectedPlates.length === 0) {
+          const now = Date.now();
+          if (now - lastDetectorValidationAt > DETECTOR_VALIDATION_INTERVAL_MS) {
+            lastDetectorValidationAt = now;
+            await validateDetector();
+          }
+        }
+
+        const bboxList = detectedPlates.map((plateBox) => ({
+          x: plateBox.bbox.x,
+          y: plateBox.bbox.y,
+          width: plateBox.bbox.width,
+          height: plateBox.bbox.height,
+          confidence: plateBox.confidence,
+        }));
+
+        const allTracks = runtime.tracker.updateTracks(bboxList);
+        const confirmedTracks = runtime.tracker.getActiveTracks(true);
+        const displayTracks = scannerSettings.debugMode ? allTracks : confirmedTracks;
+        const loopNow = Date.now();
+
+        confirmedTracks.forEach((track) => {
+          if (track.cooldownActive && !track.cooldownStartedAt) {
+            track.cooldownStartedAt = loopNow;
+          }
+
+          if (
+            track.cooldownActive &&
+            track.cooldownStartedAt &&
+            loopNow - track.cooldownStartedAt >= TRACK_RESULT_HOLD_MS
+          ) {
+            resetTrackForNextPlate(track);
+            runtime.bestFrameSelector.clearTrack(track.trackNumber);
           }
         });
-        return;
-      }
 
-      const maxOcrConcurrency = Math.min(
-        OCR_MAX_CONCURRENCY,
-        Math.max(1, s.maxOcrConcurrency || INITIAL_SETTINGS.maxOcrConcurrency)
-      );
-      const priorityIds = prioritiseTracks(
-        confirmedTracks.map(t => ({
-          trackId: t.trackId,
-          bbox: t.bbox,
-          framesSeen: t.framesSeen,
-          ocrState: t.ocrState,
-          lastOcrAttemptAt: t.lastOcrAttemptAt,
-          voteCount: Array.from(t.votes.values()).reduce((sum, vote) => sum + vote.count, 0),
-        })),
-        canvas.width,
-        canvas.height,
-        maxOcrConcurrency
-      );
-
-      for (const trackId of priorityIds) {
-        const track = trackerRef.current.getTrack(trackId);
-        if (!track || !track.isConfirmed || track.ocrRunning || track.cooldownActive) continue;
-        if (activeOcrCount.current >= maxOcrConcurrency) break;
-
-        const now = Date.now();
-        const voteCount = Array.from(track.votes.values()).reduce((sum, vote) => sum + vote.count, 0);
-        const retryDelay = voteCount === 0 ? OCR_FIRST_READ_RETRY_MS : OCR_REPEAT_READ_RETRY_MS;
-        if (track.lastOcrAttemptAt && now - track.lastOcrAttemptAt < retryDelay) continue;
-
-        const minReadableWidth = Math.max(40, s.minCropWidth || INITIAL_SETTINGS.minCropWidth);
-        const canReadFirstFrame = track.framesSeen >= 2 || track.bbox.confidence >= 0.60;
-        if (!canReadFirstFrame || track.bbox.width < minReadableWidth) {
-          track.ocrState = 'COLLECTING';
-          continue;
+        if (loopNow - runtime.lastMaintenanceTs >= SCANNER_MAINTENANCE_INTERVAL_MS) {
+          const activeTrackNumbers = new Set(allTracks.map((track) => track.trackNumber));
+          runtime.bestFrameSelector.clearExcept(activeTrackNumbers);
+          runtime.bestFrameSelector.pruneStale(undefined, activeTrackNumbers, loopNow);
+          pruneCooldownMap(cooldownMap.current, scannerSettings.duplicateCooldown * 1000, loopNow);
+          runtime.lastMaintenanceTs = loopNow;
         }
 
-        const bestFrameEntry = globalBestFrameSelector.getBestCrop(track.trackNumber);
-        const targetCropFromBest = !!bestFrameEntry?.canvas;
-        const targetCrop = bestFrameEntry?.canvas ?? cropCanvasRegionFast(canvas, track.bbox);
-        const qualityReport = bestFrameEntry?.quality || { overallScore: 0.6, recommendation: 'MARGINAL' as const };
-        // Only skip truly unusable frames — MARGINAL frames go through to OCR.
-        // The best-frame selector has already picked the sharpest available crop.
-        if (qualityReport.recommendation === 'REJECT') {
-          track.ocrState = 'LOW QUALITY';
-          continue;
-        }
+        metrics.platesVisible = bboxList.length;
+        metrics.activeTracks = confirmedTracks.length;
+        metrics.tracks = [...displayTracks];
 
-        track.ocrRunning = true;
-        track.ocrJobQueued = true;
-        track.lastOcrAttemptAt = now;
-        track.ocrState = 'OCR_RUNNING';
-        activeOcrCount.current++;
-
-        (async () => {
-          const transientCanvases: HTMLCanvasElement[] = [];
-          const rememberTransientCanvas = (crop?: HTMLCanvasElement | null) => {
-            if (crop && !transientCanvases.includes(crop)) {
-              transientCanvases.push(crop);
-            }
-          };
-
-          try {
-            if (!targetCropFromBest) rememberTransientCanvas(targetCrop);
-
-            const innerTextCrop = createInnerPlateTextCrop(targetCrop);
-            rememberTransientCanvas(innerTextCrop);
-
-            const innerCrops = generateAdaptiveCrops(
-              innerTextCrop,
-              { x: 0, y: 0, width: innerTextCrop.width, height: innerTextCrop.height, confidence: 1.0 },
-              360,
-              108,
-              ['ORIGINAL', 'INVERTED']
-            );
-            innerCrops.forEach(crop => {
-              rememberTransientCanvas(crop.canvas);
-              rememberTransientCanvas(crop.topLineCanvas);
-              rememberTransientCanvas(crop.bottomLineCanvas);
-            });
-
-            const activeTrackLoad = Math.max(1, confirmedTracks.length);
-            const fullCropVariants = activeTrackLoad >= 3
-              ? ['ORIGINAL', 'DARK_BG', 'INVERTED'] as const
-              : ['ORIGINAL', 'SHARPEN', 'DARK_BG', 'INVERTED'] as const;
-            const adaptiveCrops = generateAdaptiveCrops(
-              targetCrop,
-              { x: 0, y: 0, width: targetCrop.width, height: targetCrop.height, confidence: 1.0 },
-              360,
-              108,
-              [...fullCropVariants]
-            );
-            adaptiveCrops.forEach(crop => {
-              rememberTransientCanvas(crop.canvas);
-              rememberTransientCanvas(crop.topLineCanvas);
-              rememberTransientCanvas(crop.bottomLineCanvas);
-            });
-
-            const maxCandidateCrops = activeTrackLoad >= 3 ? 4 : 6;
-            const candidateCrops = [...innerCrops, ...adaptiveCrops].slice(0, maxCandidateCrops);
-            const fallbackCrop = {
-              canvas: targetCrop,
-              isTwoLine: targetCrop.width / Math.max(1, targetCrop.height) < 2.3,
-            };
-            const expectedMinChars = getExpectedMinPlateChars(targetCrop);
-
-            let text = '';
-            let conf = 0;
-            let bestScore = 0;
-            let bestPatternValid = false;
-
-            for (const crop of candidateCrops.length > 0 ? candidateCrops : [fallbackCrop]) {
-              const result = await recognizePlateFromCanvas(crop.canvas, crop.isTwoLine);
-              const resultText = result.normalizedPlate || result.text;
-              const pattern = validateMalaysianPattern(resultText);
-              const isPlausible = isPlausiblePlateCandidate(resultText, expectedMinChars, pattern.score);
-              const lengthScore = Math.min(1.0, resultText.length / Math.max(expectedMinChars + 1, 6));
-              const plausibilityPenalty = isPlausible ? 0 : 0.75;
-              const score =
-                result.confidence * 0.45 +
-                pattern.score * 0.30 +
-                lengthScore * 0.20 +
-                (pattern.isValid ? 0.10 : 0) -
-                plausibilityPenalty;
-
-              if (resultText && isPlausible && score >= bestScore) {
-                text = resultText;
-                conf = result.confidence;
-                bestScore = score;
-                bestPatternValid = pattern.isValid;
-              }
-
-              if (resultText && isPlausible && result.confidence >= 0.25 && pattern.score >= 0.55 && score >= 0.58) {
-                break;
-              }
-            }
-
-            const updatedTrack = trackerRef.current.getTrack(trackId);
-            if (!updatedTrack || updatedTrack.cooldownActive) return;
-
-            // Lower gate: PP-OCR softmax confidence on small/blurry crops
-            // can legitimately be 0.25–0.44 — these are valid reads that should
-            // accumulate into consensus rather than being discarded.
-            if (text && conf >= 0.25) {
-              addOcrVoteToTrack(updatedTrack, text, conf, qualityReport.overallScore);
-              updatedTrack.ocrState = 'CONSENSUS_BUILDING';
-
-              const { digits } = countPlateChars(text);
-              const canFastMatch = bestPatternValid && digits >= (text.length >= 5 ? 2 : 1);
-              const veryStrongRead = canFastMatch && conf >= Math.max(0.60, s.recognitionThreshold) && bestScore >= 0.70;
-              const strongRead = canFastMatch && conf >= 0.32 && bestScore >= 0.56;
-              const requiredVotes = veryStrongRead ? 1 : strongRead ? Math.min(2, s.consensusVotes) : s.consensusVotes;
-              const confidenceGate = veryStrongRead
-                ? Math.min(s.recognitionThreshold, 0.58)
-                : strongRead
-                  ? Math.min(s.recognitionThreshold, 0.45)
-                  : s.recognitionThreshold;
-              const consensus = evaluateConsensus(updatedTrack, requiredVotes, confidenceGate);
-              if (consensus.isStabilized) {
-                const matchConfidence = Math.max(consensus.confidence, Math.min(0.98, bestScore));
-                updatedTrack.stabilizedPlate = consensus.normalizedPlate;
-                updatedTrack.stabilizedConfidence = matchConfidence;
-                const finalOutcomeReady = canCommitFinalPlateOutcome(consensus.normalizedPlate);
-                await runDatabaseMatch(updatedTrack, consensus.normalizedPlate, matchConfidence, {
-                  commitNoCase: finalOutcomeReady,
-                });
-              }
-            } else {
-              if (updatedTrack.votes.size === 0) updatedTrack.ocrState = 'COLLECTING';
-            }
-          } catch (e) {
-            console.warn('[OCR] Error:', e);
-          } finally {
-            transientCanvases.forEach(releaseCanvasMemory);
-            const t = trackerRef.current.getTrack(trackId);
-            if (t) {
-              t.ocrRunning = false;
-              t.ocrJobQueued = false;
-              t.lastOcrCompletedAt = Date.now();
-            }
-            activeOcrCount.current = Math.max(0, activeOcrCount.current - 1);
+        const cropSampleNow = loopNow;
+        confirmedTracks.forEach((track) => {
+          if (!track.lastOverlayAngleAt || cropSampleNow - track.lastOverlayAngleAt >= OVERLAY_ANGLE_SAMPLE_MS) {
+            track.overlayAngle = estimatePlateOverlayAngle(processingCanvas, track.bbox, track.overlayAngle ?? 0);
+            track.lastOverlayAngleAt = cropSampleNow;
           }
-        })();
-      }
-    };
 
-    const renderLoop = () => {
-      if (!isPausedRef.current) {
-        const video = videoRef.current;
-        const overlayCanvas = canvasRef.current;
+          if (track.ocrState === 'COOLDOWN' || track.ocrState === 'MATCHED') return;
+          const existingCrop = runtime.bestFrameSelector.getBestCrop(track.trackNumber);
+          const sampleInterval = track.bbox.confidence >= 0.7 ? CROP_SAMPLE_FAST_MS : CROP_SAMPLE_NORMAL_MS;
+          if (existingCrop && track.lastCropSampledAt && cropSampleNow - track.lastCropSampledAt < sampleInterval) {
+            return;
+          }
+
+          const cropCanvas = cropCanvasRegionFast(processingCanvas, track.bbox);
+          runtime.bestFrameSelector.addCropCandidate(track.trackNumber, cropCanvas, track.bbox);
+          track.lastCropSampledAt = cropSampleNow;
+        });
+
+        processOcrQueue(confirmedTracks, processingCanvas, scannerSettings, runtime, slotId);
+        metrics.detFrames++;
+
+        const targetInterval = activeOcrCount.current > 0 ? DETECTION_BUSY_INTERVAL_MS : DETECTION_TARGET_INTERVAL_MS;
+        const nextDelay = Math.max(
+          DETECTION_MIN_DELAY_MS,
+          Math.round(targetInterval - (performance.now() - detectionStartedAt))
+        );
+        scheduleDetection(nextDelay);
+      };
+
+      const processOcrQueue = async (
+        confirmedTracks: ActiveTrack[],
+        canvas: HTMLCanvasElement,
+        scannerSettings: ScannerSettings,
+        slotRuntime: SlotScannerRuntime,
+        sourceSlotId: string
+      ) => {
+        if (!isPpOcrReady()) {
+          confirmedTracks.forEach((track) => {
+            if (!track.cooldownActive && track.ocrState !== 'MATCHED') {
+              track.ocrState = 'COLLECTING';
+            }
+          });
+          return;
+        }
+
+        const maxOcrConcurrency = Math.min(
+          OCR_MAX_CONCURRENCY,
+          Math.max(1, scannerSettings.maxOcrConcurrency || INITIAL_SETTINGS.maxOcrConcurrency)
+        );
+        const priorityIds = prioritiseTracks(
+          confirmedTracks.map((track) => ({
+            trackId: track.trackId,
+            bbox: track.bbox,
+            framesSeen: track.framesSeen,
+            ocrState: track.ocrState,
+            lastOcrAttemptAt: track.lastOcrAttemptAt,
+            voteCount: Array.from(track.votes.values()).reduce((sum, vote) => sum + vote.count, 0),
+          })),
+          canvas.width,
+          canvas.height,
+          maxOcrConcurrency
+        );
+
+        for (const trackId of priorityIds) {
+          const track = slotRuntime.tracker.getTrack(trackId);
+          if (!track || !track.isConfirmed || track.ocrRunning || track.cooldownActive) continue;
+          if (activeOcrCount.current >= maxOcrConcurrency) break;
+
+          const now = Date.now();
+          const voteCount = Array.from(track.votes.values()).reduce((sum, vote) => sum + vote.count, 0);
+          const retryDelay = voteCount === 0 ? OCR_FIRST_READ_RETRY_MS : OCR_REPEAT_READ_RETRY_MS;
+          if (track.lastOcrAttemptAt && now - track.lastOcrAttemptAt < retryDelay) continue;
+
+          const minReadableWidth = Math.max(40, scannerSettings.minCropWidth || INITIAL_SETTINGS.minCropWidth);
+          const canReadFirstFrame = track.framesSeen >= 2 || track.bbox.confidence >= 0.6;
+          if (!canReadFirstFrame || track.bbox.width < minReadableWidth) {
+            track.ocrState = 'COLLECTING';
+            continue;
+          }
+
+          const bestFrameEntry = slotRuntime.bestFrameSelector.getBestCrop(track.trackNumber);
+          const targetCropFromBest = !!bestFrameEntry?.canvas;
+          const targetCrop = bestFrameEntry?.canvas ?? cropCanvasRegionFast(canvas, track.bbox);
+          const qualityReport = bestFrameEntry?.quality || { overallScore: 0.6, recommendation: 'MARGINAL' as const };
+          if (qualityReport.recommendation === 'REJECT') {
+            track.ocrState = 'LOW QUALITY';
+            continue;
+          }
+
+          track.ocrRunning = true;
+          track.ocrJobQueued = true;
+          track.lastOcrAttemptAt = now;
+          track.ocrState = 'OCR_RUNNING';
+          activeOcrCount.current++;
+
+          void (async () => {
+            const transientCanvases: HTMLCanvasElement[] = [];
+            const rememberTransientCanvas = (crop?: HTMLCanvasElement | null) => {
+              if (crop && !transientCanvases.includes(crop)) {
+                transientCanvases.push(crop);
+              }
+            };
+
+            try {
+              if (!targetCropFromBest) rememberTransientCanvas(targetCrop);
+
+              const innerTextCrop = createInnerPlateTextCrop(targetCrop);
+              rememberTransientCanvas(innerTextCrop);
+
+              const innerCrops = generateAdaptiveCrops(
+                innerTextCrop,
+                { x: 0, y: 0, width: innerTextCrop.width, height: innerTextCrop.height, confidence: 1 },
+                360,
+                108,
+                ['ORIGINAL', 'INVERTED']
+              );
+              innerCrops.forEach((crop) => {
+                rememberTransientCanvas(crop.canvas);
+                rememberTransientCanvas(crop.topLineCanvas);
+                rememberTransientCanvas(crop.bottomLineCanvas);
+              });
+
+              const activeTrackLoad = Math.max(1, confirmedTracks.length);
+              const fullCropVariants =
+                activeTrackLoad >= 3
+                  ? (['ORIGINAL', 'DARK_BG', 'INVERTED'] as const)
+                  : (['ORIGINAL', 'SHARPEN', 'DARK_BG', 'INVERTED'] as const);
+              const adaptiveCrops = generateAdaptiveCrops(
+                targetCrop,
+                { x: 0, y: 0, width: targetCrop.width, height: targetCrop.height, confidence: 1 },
+                360,
+                108,
+                [...fullCropVariants]
+              );
+              adaptiveCrops.forEach((crop) => {
+                rememberTransientCanvas(crop.canvas);
+                rememberTransientCanvas(crop.topLineCanvas);
+                rememberTransientCanvas(crop.bottomLineCanvas);
+              });
+
+              const maxCandidateCrops = activeTrackLoad >= 3 ? 4 : 6;
+              const candidateCrops = [...innerCrops, ...adaptiveCrops].slice(0, maxCandidateCrops);
+              const fallbackCrop = {
+                canvas: targetCrop,
+                isTwoLine: targetCrop.width / Math.max(1, targetCrop.height) < 2.3,
+              };
+              const expectedMinChars = getExpectedMinPlateChars(targetCrop);
+
+              let text = '';
+              let conf = 0;
+              let bestScore = 0;
+              let bestPatternValid = false;
+
+              for (const crop of candidateCrops.length > 0 ? candidateCrops : [fallbackCrop]) {
+                const result = await recognizePlateFromCanvas(crop.canvas, crop.isTwoLine);
+                const resultText = result.normalizedPlate || result.text;
+                const pattern = validateMalaysianPattern(resultText);
+                const isPlausible = isPlausiblePlateCandidate(resultText, expectedMinChars, pattern.score);
+                const lengthScore = Math.min(1, resultText.length / Math.max(expectedMinChars + 1, 6));
+                const plausibilityPenalty = isPlausible ? 0 : 0.75;
+                const score =
+                  result.confidence * 0.45 +
+                  pattern.score * 0.3 +
+                  lengthScore * 0.2 +
+                  (pattern.isValid ? 0.1 : 0) -
+                  plausibilityPenalty;
+
+                if (resultText && isPlausible && score >= bestScore) {
+                  text = resultText;
+                  conf = result.confidence;
+                  bestScore = score;
+                  bestPatternValid = pattern.isValid;
+                }
+
+                if (resultText && isPlausible && result.confidence >= 0.25 && pattern.score >= 0.55 && score >= 0.58) {
+                  break;
+                }
+              }
+
+              const updatedTrack = slotRuntime.tracker.getTrack(trackId);
+              if (!updatedTrack || updatedTrack.cooldownActive) return;
+
+              if (text && conf >= 0.25) {
+                addOcrVoteToTrack(updatedTrack, text, conf, qualityReport.overallScore);
+                updatedTrack.ocrState = 'CONSENSUS_BUILDING';
+
+                const { digits } = countPlateChars(text);
+                const canFastMatch = bestPatternValid && digits >= (text.length >= 5 ? 2 : 1);
+                const veryStrongRead =
+                  canFastMatch && conf >= Math.max(0.6, scannerSettings.recognitionThreshold) && bestScore >= 0.7;
+                const strongRead = canFastMatch && conf >= 0.32 && bestScore >= 0.56;
+                const requiredVotes = veryStrongRead
+                  ? 1
+                  : strongRead
+                    ? Math.min(2, scannerSettings.consensusVotes)
+                    : scannerSettings.consensusVotes;
+                const confidenceGate = veryStrongRead
+                  ? Math.min(scannerSettings.recognitionThreshold, 0.58)
+                  : strongRead
+                    ? Math.min(scannerSettings.recognitionThreshold, 0.45)
+                    : scannerSettings.recognitionThreshold;
+                const consensus = evaluateConsensus(updatedTrack, requiredVotes, confidenceGate);
+
+                if (consensus.isStabilized) {
+                  const matchConfidence = Math.max(consensus.confidence, Math.min(0.98, bestScore));
+                  updatedTrack.stabilizedPlate = consensus.normalizedPlate;
+                  updatedTrack.stabilizedConfidence = matchConfidence;
+                  const finalOutcomeReady = canCommitFinalPlateOutcome(consensus.normalizedPlate);
+                  await runDatabaseMatch(updatedTrack, consensus.normalizedPlate, matchConfidence, sourceSlotId, {
+                    commitNoCase: finalOutcomeReady,
+                  });
+                }
+              } else if (updatedTrack.votes.size === 0) {
+                updatedTrack.ocrState = 'COLLECTING';
+              }
+            } catch (err) {
+              console.warn(`[OCR:${sourceSlotId}] Error:`, err);
+            } finally {
+              transientCanvases.forEach(releaseCanvasMemory);
+              const refreshedTrack = slotRuntime.tracker.getTrack(trackId);
+              if (refreshedTrack) {
+                refreshedTrack.ocrRunning = false;
+                refreshedTrack.ocrJobQueued = false;
+                refreshedTrack.lastOcrCompletedAt = Date.now();
+              }
+              activeOcrCount.current = Math.max(0, activeOcrCount.current - 1);
+            }
+          })();
+        }
+      };
+
+      const renderLoop = () => {
+        const video = videoRefs.current[slotId];
+        const overlayCanvas = canvasRefs.current[slotId];
 
         if (video && overlayCanvas && video.readyState >= 2 && video.videoWidth > 0) {
           if (overlayCanvas.width !== video.videoWidth || overlayCanvas.height !== video.videoHeight) {
@@ -1211,585 +1402,799 @@ export default function ScannerPage() {
           const overlayCtx = overlayCanvas.getContext('2d');
           if (overlayCtx) {
             overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-            const s = settingsRef.current;
-            const displayTracks = s.debugMode
-              ? trackerRef.current.getActiveTracks(false)
-              : trackerRef.current.getActiveTracks(true);
-            drawOverlays(overlayCtx, overlayCanvas.width, overlayCanvas.height, displayTracks, s.showCenterGuide, s.debugMode);
+            const scannerSettings = settingsRef.current;
+            const displayTracks = scannerSettings.debugMode
+              ? runtime.tracker.getActiveTracks(false)
+              : runtime.tracker.getActiveTracks(true);
+            drawOverlays(
+              overlayCtx,
+              overlayCanvas.width,
+              overlayCanvas.height,
+              displayTracks,
+              scannerSettings.showCenterGuide
+            );
           }
 
           if (video.currentTime !== lastVideoTime) {
-            camFrameCount.current++;
+            metrics.camFrames++;
             lastVideoTime = video.currentTime;
           }
         }
 
         const now = Date.now();
-        if (now - lastFpsTs.current >= 1000) {
-          setCamFps(camFrameCount.current);
-          camFrameCount.current = 0;
-          lastFpsTs.current = now;
+        if (now - lastMetricsFlushTs.current >= 1000) {
+          lastMetricsFlushTs.current = now;
+          flushScannerMetrics();
         }
-      }
-      animId = requestAnimationFrame(renderLoop);
-    };
 
-    animId = requestAnimationFrame(renderLoop);
-    scheduleDetection(100);
+        animId = requestAnimationFrame(renderLoop);
+      };
+
+      animId = requestAnimationFrame(renderLoop);
+      scheduleDetection(100);
+
+      return () => {
+        cancelAnimationFrame(animId);
+        if (detectionTimeout) clearTimeout(detectionTimeout);
+        metrics.platesVisible = 0;
+        metrics.activeTracks = 0;
+        metrics.tracks = [];
+      };
+    });
 
     return () => {
       stopped = true;
-      cancelAnimationFrame(animId);
-      if (detectionTimeout) clearTimeout(detectionTimeout);
+      window.clearInterval(flushInterval);
+      cleanupRunners.forEach((cleanup) => cleanup());
+      flushScannerMetrics();
     };
-  }, [cameraReady, runDatabaseMatch]);
+  }, [
+    cameraSlots,
+    ensureSlotMetrics,
+    flushScannerMetrics,
+    getSlotRuntime,
+    isCameraReady,
+    isScanning,
+    previewSlotIds,
+    runDatabaseMatch,
+    supportsMultiCameraScan,
+  ]);
 
-  // ─── 8. Canvas Overlay Drawing ────────────────────────────────────────────
   function drawOverlays(
     ctx: CanvasRenderingContext2D,
-    W: number,
-    H: number,
+    width: number,
+    height: number,
     tracks: ActiveTrack[],
-    showGuide: boolean,
-    debug: boolean
+    showGuide: boolean
   ) {
     if (showGuide) {
-      ctx.strokeStyle = 'rgba(0, 216, 246, 0.2)';
+      ctx.strokeStyle = 'rgba(6, 182, 212, 0.28)';
       ctx.lineWidth = 1;
       ctx.setLineDash([6, 4]);
-      const gW = W * 0.6, gH = gW / 4;
-      ctx.strokeRect((W - gW) / 2, (H - gH) / 2, gW, gH);
+      const guideWidth = width * 0.6;
+      const guideHeight = guideWidth / 4;
+      ctx.strokeRect((width - guideWidth) / 2, (height - guideHeight) / 2, guideWidth, guideHeight);
       ctx.setLineDash([]);
     }
 
-    tracks.forEach(track => {
-      // Use smoothBbox for display so camera shake doesn't make boxes jitter.
-      const { x, y, width, height } = track.smoothBbox;
+    tracks.forEach((track) => {
+      const { x, y, width: boxWidth, height: boxHeight } = track.smoothBbox;
       const color = getTrackColor(track);
-      const label = getTrackStatusLabel(track);
-      const reading = getTrackPlateText(track);
+      const label = getTrackPlateText(track) || getTrackStatusLabel(track);
       const angle = track.overlayAngle ?? 0;
-      const cx = x + width / 2;
-      const cy = y + height / 2;
-      const boxW = width * 1.02;
-      const boxH = height * 1.08;
+      const cx = x + boxWidth / 2;
+      const cy = y + boxHeight / 2;
+      const drawWidth = boxWidth * 1.02;
+      const drawHeight = boxHeight * 1.08;
 
       ctx.save();
       ctx.translate(cx, cy);
       ctx.rotate(angle);
       ctx.strokeStyle = color;
       ctx.lineWidth = 3;
-      ctx.setLineDash([]);
       ctx.shadowColor = color;
       ctx.shadowBlur = 8;
       ctx.beginPath();
-      drawRoundedRect(ctx, -boxW / 2, -boxH / 2, boxW, boxH, 7);
+      drawRoundedRect(ctx, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight, 7);
       ctx.stroke();
       ctx.restore();
 
-      const labelText = reading || label;
+      if (!label) return;
 
-      if (labelText) {
-        ctx.save();
-        ctx.font = 'bold 14px sans-serif';
-        const textW = ctx.measureText(labelText).width;
-        const pillW = Math.max(56, textW + 18);
-        const pillH = 26;
-        const normalX = Math.sin(angle);
-        const normalY = -Math.cos(angle);
-        const pillCx = clampNumber(cx + normalX * (boxH / 2 + pillH / 2 + 6), pillW / 2 + 2, W - pillW / 2 - 2);
-        const pillCy = clampNumber(cy + normalY * (boxH / 2 + pillH / 2 + 6), pillH / 2 + 2, H - pillH / 2 - 2);
-        const pillX = pillCx - pillW / 2;
-        const pillY = pillCy - pillH / 2;
+      ctx.save();
+      ctx.font = 'bold 14px sans-serif';
+      const textWidth = ctx.measureText(label).width;
+      const pillWidth = Math.max(56, textWidth + 18);
+      const pillHeight = 26;
+      const normalX = Math.sin(angle);
+      const normalY = -Math.cos(angle);
+      const pillCx = clampNumber(cx + normalX * (drawHeight / 2 + pillHeight / 2 + 6), pillWidth / 2 + 2, width - pillWidth / 2 - 2);
+      const pillCy = clampNumber(cy + normalY * (drawHeight / 2 + pillHeight / 2 + 6), pillHeight / 2 + 2, height - pillHeight / 2 - 2);
+      const pillX = pillCx - pillWidth / 2;
+      const pillY = pillCy - pillHeight / 2;
 
-        ctx.shadowColor = color;
-        ctx.shadowBlur = 10;
-        ctx.fillStyle = color;
-        ctx.beginPath();
-        drawRoundedRect(ctx, pillX, pillY, pillW, pillH, 6);
-        ctx.fill();
-
-        ctx.shadowBlur = 0;
-        ctx.fillStyle = track.matchType === 'EXACT' ? '#ffffff' : '#061018';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(labelText, pillCx, pillCy);
-        ctx.restore();
-      }
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 10;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      drawRoundedRect(ctx, pillX, pillY, pillWidth, pillHeight, 6);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = track.matchType === 'EXACT' ? '#ffffff' : '#020617';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, pillCx, pillCy);
+      ctx.restore();
     });
   }
 
-  // ─── 9. Match Actions ─────────────────────────────────────────────────────
-  const confirmVehicle = async (entry: MatchEntry) => {
-    if (entry.scanId) {
-      await fetch('/api/scans', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: entry.scanId, action: 'CONFIRM' }),
+  const handleMarkAsSeen = () => {
+    if (activeAlertMatch) {
+      const flaggedObj = { ...activeAlertMatch.vehicle, status: 'FLAGGED' as const };
+      updateVehicle(flaggedObj);
+      addHistoryLog({
+        type: 'DETECTION',
+        action: `Tanda Tindakan (Disemak): ${activeAlertMatch.vehicle.plate}`,
+        plate: activeAlertMatch.vehicle.plate,
+        details: `Alert Tanda Tindakan disemak oleh ${role} pada ${activeAlertMatch.cameraName}`,
+        note: `Ditanda Tindakan oleh ${role} pada ${activeAlertMatch.cameraName}`,
+        userRole: role,
+        statusMatch: 'EXACT',
       });
     }
-    setMatchQueue(q => q.filter(m => m.plate !== entry.plate));
-    setViewingMatch(null);
+    setActiveAlertMatch(null);
   };
 
-  const reportWrong = async (entry: MatchEntry) => {
-    if (entry.scanId) {
-      await fetch('/api/scans', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: entry.scanId, action: 'REPORT_WRONG' }),
-      });
+  const handleMarkDetectionAction = (detection: SessionDetection) => {
+    if (!detection.vehicleId) return;
+
+    const vehicle = vehicles.find((item) => item.id === detection.vehicleId);
+    if (!vehicle) return;
+
+    const flaggedObj = { ...vehicle, status: 'FLAGGED' as const };
+    updateVehicle(flaggedObj);
+    addHistoryLog({
+      type: 'DETECTION',
+      action: `Tanda Tindakan (Pengimbas): ${vehicle.plate}`,
+      plate: vehicle.plate,
+      details: `Scanner action confirmed by ${role} from ${detection.cameraName}`,
+      note: `Ditanda Tindakan oleh ${role} dari ${detection.cameraName}`,
+      userRole: role,
+      statusMatch: 'EXACT',
+    });
+
+    setLiveDetections((prevStream) => {
+      const nextStream = prevStream.map((item) =>
+        item.id === detection.id ? { ...item, matched: true, matchType: 'EXACT' as const, vehicleId: vehicle.id } : item
+      );
+      localStorage.setItem(RECENT_DETECTIONS_STORAGE_KEY, JSON.stringify(nextStream));
+      return nextStream;
+    });
+
+    if (activeAlertMatch?.vehicle.id === vehicle.id) {
+      setActiveAlertMatch(null);
     }
-    setMatchQueue(q => q.filter(m => m.plate !== entry.plate));
-    setViewingMatch(null);
   };
 
-  const activeMatches = matchQueue.filter(m => !m.dismissed);
-  const isReadingPlate = cameraReady && !cameraError && tracksList.some(
-    t => ['COLLECTING', 'OCR_RUNNING', 'OCR RUNNING', 'CONSENSUS_BUILDING', 'CONSENSUS', 'DB_CHECKING', 'DATABASE CHECK'].includes(t.ocrState)
-  );
   const runtimeReady = isRuntimeScanningReady(runtimeState);
-  const bottomStatus = cameraError
-    ? { label: 'CAMERA UNAVAILABLE', dotClass: 'bg-rose-500', textClass: 'text-rose-400' }
-    : !cameraReady
-      ? { label: 'STARTING CAMERA', dotClass: 'bg-slate-500 animate-pulse', textClass: 'text-slate-400' }
-      : !runtimeReady
-        ? { label: 'AI WARMING UP', dotClass: 'bg-[#00d8f6] animate-pulse', textClass: 'text-[#00d8f6]' }
-      : isPaused
-        ? { label: 'SCANNER PAUSED', dotClass: 'bg-slate-500', textClass: 'text-slate-400' }
-        : isReadingPlate
-          ? { label: 'READING PLATE', dotClass: 'bg-[#00d8f6] animate-pulse', textClass: 'text-[#00d8f6]' }
-          : { label: 'SCANNING SCENE', dotClass: 'bg-amber-500 animate-pulse', textClass: 'text-amber-500' };
-  const resultTrack = tracksList.find(t => t.stabilizedPlate)
-    || tracksList.find(t => getTrackPlateText(t))
-    || null;
-  const resultPlateText = resultTrack ? getTrackPlateText(resultTrack) : '';
-  const hasResultCard = cameraReady && !cameraError && !!resultTrack && !!resultPlateText;
-  const resultStatus = resultTrack?.matchType === 'EXACT'
-    ? { label: 'Match Found', chipClass: 'bg-rose-500/15 text-rose-300 border-rose-400/40', iconClass: 'text-rose-300 bg-rose-500/15' }
-    : resultTrack?.matchType === 'POSSIBLE'
-      ? { label: 'Possible', chipClass: 'bg-amber-500/15 text-amber-300 border-amber-400/40', iconClass: 'text-amber-300 bg-amber-500/15' }
-      : resultTrack?.matchType === 'NONE'
-        ? { label: 'No Case', chipClass: 'bg-emerald-500/15 text-emerald-300 border-emerald-400/40', iconClass: 'text-emerald-300 bg-emerald-500/15' }
-        : { label: 'Active', chipClass: 'bg-[#00d8f6]/15 text-[#00d8f6] border-[#00d8f6]/40', iconClass: 'text-[#00d8f6] bg-[#00d8f6]/15' };
+  const visibleTrack = tracksList.find((track) => getTrackPlateText(track)) || tracksList[0] || null;
+  const activeScanTileCount = supportsMultiCameraScan
+    ? cameraSlots.filter((slot) => previewSlotIds.includes(slot.id)).length
+    : previewSlotIds.includes(activeCameraSlotId)
+      ? 1
+      : 0;
+  const scannerStatusText = cameraError
+    ? 'Camera unavailable'
+    : isScanning && runtimeReady && supportsMultiCameraScan
+    ? `Scanning ${activeScanTileCount || 1} camera${(activeScanTileCount || 1) === 1 ? '' : 's'}${visibleTrack ? ` - ${getTrackStatusLabel(visibleTrack)}` : ''}`
+    : isScanning && runtimeReady
+    ? `Scanning selected camera${visibleTrack ? ` - ${getTrackStatusLabel(visibleTrack)}` : ''}`
+    : isScanning
+    ? 'AI models warming up'
+    : previewSlotIds.length > 0
+    ? 'Camera preview ready'
+    : 'Choose camera in preview and start scanning';
+  const latestDetection = liveDetections[0] || null;
+  const latestExactVehicle =
+    latestDetection?.vehicleId ? vehicles.find((vehicle) => vehicle.id === latestDetection.vehicleId) || null : null;
+  const latestPossibleVehicles =
+    latestDetection?.possibleVehicleIds
+      ?.map((vehicleId) => vehicles.find((vehicle) => vehicle.id === vehicleId) || null)
+      .filter((vehicle): vehicle is Vehicle => Boolean(vehicle)) || [];
+  const latestSearchHref = latestDetection ? `/search?plate=${encodeURIComponent(latestDetection.plate)}` : '/search';
+  const latestResultTone =
+    latestDetection?.matchType === 'EXACT' || latestDetection?.matched
+      ? 'EXACT'
+      : latestDetection?.matchType === 'POSSIBLE'
+      ? 'POSSIBLE'
+      : latestDetection
+      ? 'NONE'
+      : null;
 
   return (
-    <div className="fixed inset-0 bg-black flex flex-col overflow-hidden" style={{ zIndex: 100 }}>
-
-      {/* ── TOP CONTROL BAR ── */}
-      <div className="flex-shrink-0 flex items-center justify-between px-3 py-2 bg-black/80 backdrop-blur-md border-b border-white/10 z-20">
-        <Link
-          href="/"
-          className="flex items-center gap-1.5 text-xs font-semibold text-slate-300 hover:text-white"
-        >
-          <ArrowLeft className="w-4 h-4" />
-          <span className="hidden sm:inline">Back</span>
-        </Link>
-
-        <div className="flex items-center gap-2">
-          <div className="w-1.5 h-1.5 rounded-full bg-[#00d8f6] animate-ping" />
-          <span className="text-xs sm:text-sm font-black tracking-widest text-white uppercase">
-            Live ANPR Multi-Vehicle Scanner
-          </span>
+    <div className="space-y-4 max-w-6xl mx-auto px-1 sm:px-0">
+      <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3 sm:p-4 shadow-xl flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <Link
+            href="/"
+            className="p-1.5 sm:p-2 rounded-xl bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white transition-all shrink-0"
+            title={language === 'BM' ? 'Kembali ke Papan Utama' : 'Back to Dashboard'}
+          >
+            <ArrowLeft className="w-4 h-4" />
+          </Link>
+          <div>
+            <h1 className="text-xs sm:text-base font-black text-white uppercase tracking-wider">
+              {t('liveScannerTitle')}
+            </h1>
+            <p className="text-[10px] text-slate-500 hidden sm:block">
+              {scannerStatusText}
+            </p>
+          </div>
         </div>
 
-        <div className="flex items-center gap-1.5">
-          {torchSupported && (
+        <div className="flex items-center justify-end gap-2">
+            {isScanning && (
+              <div className="hidden lg:flex items-center gap-1.5 font-mono text-[10px] text-slate-400">
+                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">CAM {camFps}</span>
+                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">AI {detFps}</span>
+                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">PLT {platesVisible}</span>
+                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">TRK {activeTracksCount}</span>
+              </div>
+            )}
+            {supportsMultiCameraScan && (
+              <button
+                type="button"
+                onClick={() => void handleAddCamera()}
+                disabled={cameraSlots.length >= 4}
+                className="hidden sm:inline-flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-bold text-slate-300 transition-all hover:border-cyan-700 hover:text-cyan-300 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Add Camera</span>
+              </button>
+            )}
+            {isScanning ? (
+              <button
+                onClick={handlePauseScanning}
+                className="flex-1 sm:flex-initial px-4 py-2 rounded-xl bg-amber-950 text-amber-300 border border-amber-700 text-xs font-black uppercase flex items-center justify-center gap-2"
+              >
+                <Pause className="w-4 h-4" />
+                <span>Pause Scan</span>
+              </button>
+            ) : (
+              <button
+                onClick={() => void handleStartScanning()}
+                className="flex-1 sm:flex-initial px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-black uppercase flex items-center justify-center gap-2 shadow-lg shadow-cyan-500/20"
+              >
+                <Play className="w-4 h-4" />
+                <span>Start Scanning</span>
+              </button>
+            )}
             <button
-              onClick={toggleTorch}
-              className={`p-2 rounded-lg border text-xs transition-colors ${torchOn ? 'bg-amber-500/20 text-amber-400 border-amber-500/30' : 'bg-white/5 text-slate-400 border-white/10 hover:text-white'}`}
-              aria-label="Torch"
+              onClick={() => setSoundEnabled(!soundEnabled)}
+              className={`p-2 rounded-xl border text-xs font-bold transition-all shrink-0 ${
+                soundEnabled
+                  ? 'bg-cyan-950 text-cyan-400 border-cyan-800'
+                  : 'bg-slate-800 text-slate-400 border-slate-700'
+              }`}
+              title="Toggle sound"
             >
-              {torchOn ? <Zap className="w-4 h-4" /> : <ZapOff className="w-4 h-4" />}
+              {soundEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
             </button>
-          )}
-          {devices.length > 1 && (
-            <button
-              onClick={handleSwitchCamera}
-              className="p-2 bg-white/5 border border-white/10 rounded-lg text-slate-300 hover:text-white"
-              aria-label="Switch Camera"
-            >
-              <SwitchCamera className="w-4 h-4" />
-            </button>
-          )}
-          <button
-            onClick={togglePause}
-            className={`p-2 rounded-lg border transition-colors ${isPaused ? 'bg-[#00d8f6]/20 text-[#00d8f6] border-[#00d8f6]/30' : 'bg-white/5 text-slate-300 border-white/10 hover:text-white'}`}
-            aria-label={isPaused ? 'Resume' : 'Pause'}
-          >
-            {isPaused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
-          </button>
-          <Link
-            href="/settings"
-            className="p-2 bg-white/5 border border-white/10 rounded-lg text-slate-300 hover:text-white"
-            aria-label="Settings"
-          >
-            <SettingsIcon className="w-4 h-4" />
-          </Link>
         </div>
       </div>
 
-      {/* ── MODEL STATUS BANNER (Only renders on error/degraded or if debugMode is true) ── */}
+      {cameraError && (
+        <div className="rounded-xl border border-red-800 bg-red-950/40 px-4 py-3 text-xs font-bold text-red-300">
+          {cameraError}
+        </div>
+      )}
+
       {!cameraError && (
-        <div className="px-3 py-1.5 z-20">
-          <ModelStatusBanner
-            runtimeState={runtimeState}
-            detectorProvider={detectorProvider}
-            ocrProvider={ocrProvider}
-            benchmark={benchmarkResult}
-            errorMessage={runtimeErrorMessage}
-            debugMode={isDebugMode}
-            onRetry={startRuntimeInit}
-            onManualSearch={() => window.location.href = '/search'}
-          />
-        </div>
+        <ModelStatusBanner
+          runtimeState={runtimeState}
+          detectorProvider={detectorProvider}
+          ocrProvider={ocrProvider}
+          benchmark={benchmarkResult}
+          errorMessage={runtimeErrorMessage}
+          debugMode={false}
+          onRetry={startRuntimeInit}
+          onManualSearch={() => {
+            window.location.href = '/search';
+          }}
+        />
       )}
 
-      {/* ── DEBUG PERFORMANCE CHIP (Strictly gated behind debugMode === true) ── */}
-      {isDebugMode && (
-        <div className="px-3 py-1 z-20 flex items-center gap-1.5 text-[10px] font-mono font-bold pointer-events-none">
-          <span className="px-2 py-0.5 bg-black/70 text-[#00d8f6] rounded border border-[#00d8f6]/30">
-            CAM {camFps} FPS
-          </span>
-          <span className="px-2 py-0.5 bg-black/70 text-amber-400 rounded border border-amber-400/30">
-            DET {detFps} FPS
-          </span>
-          <span className="px-2 py-0.5 bg-black/70 text-emerald-400 rounded border border-emerald-400/30">
-            PLATES {platesVisible}
-          </span>
-          <span className="px-2 py-0.5 bg-black/70 text-slate-300 rounded border border-slate-700">
-            TRACKS {activeTracksCount}
-          </span>
-        </div>
-      )}
-
-      {/* ── MAIN CAMERA CANVAS AREA ── */}
-      <div className="flex-1 relative overflow-hidden">
-        {/* TOP MATCH / READING BANNER */}
-        {(() => {
-          const activeWithPlate = tracksList.find(t => t.isConfirmed && t.stabilizedPlate) || tracksList.find(t => t.stabilizedPlate);
-          if (activeWithPlate && activeWithPlate.stabilizedPlate) {
-            const badgeBg = activeWithPlate.matchType === 'EXACT'
-              ? 'bg-rose-950/90 text-rose-300 border-rose-500/50'
-              : activeWithPlate.matchType === 'POSSIBLE'
-                ? 'bg-amber-950/90 text-amber-300 border-amber-500/50'
-                : activeWithPlate.matchType === 'NONE'
-                  ? 'bg-slate-900/90 text-slate-300 border-slate-700'
-                  : 'bg-[#062936]/90 text-[#00d8f6] border-[#00d8f6]/40';
-
-            const statusLabel = activeWithPlate.matchType === 'EXACT'
-              ? 'REPO MATCH FOUND'
-              : activeWithPlate.matchType === 'POSSIBLE'
-                ? 'POSSIBLE MATCH'
-                : activeWithPlate.matchType === 'NONE'
-                  ? 'NO MATCH IN DATABASE'
-                  : 'READING PLATE';
-            const statusIcon = activeWithPlate.matchType === 'EXACT'
-              ? '!'
-              : activeWithPlate.matchType === 'POSSIBLE'
-                ? '!'
-                : activeWithPlate.matchType === 'NONE'
-                  ? '✓'
-                  : '•';
+      <div
+        className="relative bg-slate-950 border border-slate-800 rounded-2xl overflow-hidden shadow-xl sm:aspect-video"
+      >
+        <div
+          className={`grid gap-1.5 p-1.5 sm:absolute sm:inset-0 ${
+            cameraSlots.length === 1
+              ? 'grid-cols-1'
+              : cameraSlots.length === 2
+              ? 'grid-cols-1 sm:grid-cols-2'
+              : 'grid-cols-1 sm:grid-cols-2'
+          }`}
+        >
+          {cameraSlots.map((slot, index) => {
+            const slotLabel = getCameraSlotLabel(slot, index);
+            const isActiveSlot = activeCameraSlotId === slot.id;
+            const isScanningSlot =
+              isScanning &&
+              (supportsMultiCameraScan
+                ? previewSlotIds.includes(slot.id)
+                : lastDetectedSlotId
+                  ? lastDetectedSlotId === slot.id
+                  : isActiveSlot);
+            const isAlertSlot = activeAlertMatch?.cameraId === slot.id;
 
             return (
-              <div className="absolute top-6 left-1/2 -translate-x-1/2 z-30 transition-all duration-300 pointer-events-none">
-                <div className={`px-5 py-2.5 rounded-full font-semibold text-xs shadow-2xl border backdrop-blur-md flex items-center gap-2 ${badgeBg}`}>
-                   <span className="font-bold">{statusIcon} {statusLabel}</span>
-                   <span className="opacity-40">|</span>
-                   <span className="font-mono font-extrabold text-white text-sm tracking-wider">{activeWithPlate.stabilizedPlate}</span>
-                </div>
-              </div>
-            );
-          }
-          return null;
-        })()}
-
-        {/* BOTTOM SCANNING STATUS PILL */}
-        {cameraReady && !cameraError && runtimeReady && (
-          <div className={`absolute ${hasResultCard ? (trayExpanded ? 'bottom-48' : 'bottom-32') : 'bottom-6'} left-1/2 -translate-x-1/2 z-30 transition-all duration-300 pointer-events-none`}>
-            {(() => {
-              if (isReadingPlate) {
-                return (
-                  <div className="bg-[#00d8f6]/95 text-slate-950 px-6 py-2.5 rounded-full font-bold text-xs shadow-2xl border border-[#00d8f6] backdrop-blur-md flex items-center gap-2 animate-pulse">
-                    <span className="w-2 h-2 rounded-full bg-slate-950 animate-ping" />
-                    <span>Reading plate...</span>
-                  </div>
-                );
-              }
-              return (
-                <div className="bg-[#1a1c23]/95 text-slate-200 px-6 py-2.5 rounded-full font-semibold text-xs shadow-2xl border border-white/10 backdrop-blur-md flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-                  <span>Scanning scene for plates...</span>
-                </div>
-              );
-            })()}
-          </div>
-        )}
-        {cameraError && (
-          <div className="absolute inset-0 flex items-center justify-center bg-[#090a0f] z-10 p-6">
-            <div className="max-w-sm text-center">
-              <AlertOctagon className="w-12 h-12 text-rose-500 mx-auto mb-3" />
-              <h3 className="text-lg font-bold text-white mb-2">Camera Error</h3>
-              <p className="text-xs text-slate-400 mb-4">{cameraError}</p>
-              <button
-                onClick={() => initCamera()}
-                className="px-5 py-2.5 bg-[#00d8f6] text-slate-950 text-xs font-bold rounded-xl"
-              >
-                Retry Camera
-              </button>
-            </div>
-          </div>
-        )}
-
-        {!cameraError && !cameraReady && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#090a0f] z-10 gap-4">
-            <div className="w-12 h-12 border-4 border-[#00d8f6]/20 border-t-[#00d8f6] rounded-full animate-spin" />
-            <p className="text-sm font-semibold text-slate-400">Loading YOLOv8 Malaysian Plate Detector…</p>
-          </div>
-        )}
-
-        <video
-          ref={videoRef}
-          playsInline
-          muted
-          className="absolute inset-0 w-full h-full object-cover"
-          style={{ display: cameraReady && !cameraError ? 'block' : 'none' }}
-        />
-
-        <canvas
-          ref={canvasRef}
-          className="absolute inset-0 w-full h-full object-cover pointer-events-none"
-          style={{ display: cameraReady ? 'block' : 'none' }}
-        />
-
-        {isPaused && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-10">
-            <div className="flex flex-col items-center gap-2">
-              <Pause className="w-14 h-14 text-white/60" />
-              <span className="text-lg font-bold text-white/70">Paused</span>
-              <button
-                onClick={togglePause}
-                className="mt-2 px-6 py-2.5 bg-[#00d8f6] text-slate-950 font-bold text-sm rounded-xl"
-              >
-                Resume Scanning
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* MATCH NOTIFICATION BADGES */}
-        {activeMatches.length > 0 && !viewingMatch && (
-          <div className="absolute top-3 right-3 z-20 flex flex-col gap-2">
-            {activeMatches.map(entry => (
-              <button
-                key={entry.plate}
-                onClick={() => setViewingMatch(entry)}
-                className={`flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-bold shadow-2xl border backdrop-blur-sm transition-all hover:scale-105 ${
-                  entry.type === 'EXACT'
-                    ? 'bg-rose-600/90 border-rose-500 text-white shadow-rose-900/60'
-                    : 'bg-amber-500/90 border-amber-400 text-slate-950 shadow-amber-900/60'
+              <div
+                key={slot.id}
+                onClick={() => handleSelectActiveSlot(slot.id)}
+                className={`relative min-h-[420px] sm:min-h-0 rounded-xl overflow-hidden border bg-slate-950 text-left transition-all ${
+                  isAlertSlot
+                    ? 'border-red-500 ring-2 ring-red-500/40'
+                    : isActiveSlot
+                    ? 'border-cyan-500/70 ring-1 ring-cyan-500/30'
+                    : 'border-slate-800'
                 }`}
               >
-                {entry.type === 'EXACT' ? (
-                  <AlertOctagon className="w-4 h-4 shrink-0" />
-                ) : (
-                  <AlertTriangle className="w-4 h-4 shrink-0" />
+                <video
+                  ref={(node) => {
+                    videoRefs.current[slot.id] = node;
+                  }}
+                  className="absolute inset-0 h-full w-full object-cover"
+                  muted
+                  playsInline
+                  autoPlay
+                />
+
+                {!previewSlotIds.includes(slot.id) && (
+                  <div className="absolute inset-0 bg-slate-950 flex flex-col items-center justify-center gap-3 text-center p-6">
+                    <div className="w-12 h-12 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center">
+                      <Video className="w-6 h-6 text-cyan-400" />
+                    </div>
+                    <div>
+                      <div className="text-xs font-black text-white uppercase tracking-wider">{slotLabel}</div>
+                      <div className="text-[10px] text-slate-500 mt-1">Choose camera and use preview before scanning.</div>
+                    </div>
+                  </div>
                 )}
-                <span className="font-mono">{entry.plate}</span>
-                <span>{entry.type === 'EXACT' ? 'MATCH' : 'POSSIBLE'}</span>
-              </button>
-            ))}
-          </div>
-        )}
 
-        {hasResultCard && resultTrack && (
-          <div className="absolute bottom-3 left-3 right-3 z-30 pointer-events-auto">
-            <div className="rounded-2xl bg-[#101116]/95 border border-white/10 shadow-2xl backdrop-blur-md overflow-hidden">
-              <button
-                onClick={() => setTrayExpanded(v => !v)}
-                className="w-full flex items-center gap-3 px-4 py-3 text-left"
+                {isScanningSlot && (
+                  <>
+                    <div className="absolute inset-0 bg-[linear-gradient(rgba(6,182,212,0.10)_1px,transparent_1px),linear-gradient(90deg,rgba(6,182,212,0.10)_1px,transparent_1px)] bg-[size:48px_48px]" />
+                    <div className="absolute inset-x-0 h-0.5 bg-cyan-400/90 animate-laser shadow-[0_0_16px_#06B6D4]" />
+                    <div className="absolute inset-4 border border-cyan-400/40 rounded-lg shadow-[0_0_30px_rgba(6,182,212,0.20)_inset]" />
+                  </>
+                )}
+
+                <canvas
+                  ref={(node) => {
+                    canvasRefs.current[slot.id] = node;
+                  }}
+                  className="absolute inset-0 z-10 h-full w-full object-cover pointer-events-none"
+                />
+
+                <div className="absolute inset-x-2.5 top-2.5 z-20 flex items-center gap-1.5">
+                  <span className={`h-2 w-2 rounded-full shrink-0 ${isAlertSlot ? 'bg-red-400 animate-pulse' : isScanningSlot ? 'bg-emerald-400 animate-pulse' : previewSlotIds.includes(slot.id) ? 'bg-cyan-400' : 'bg-slate-500'}`} />
+                  <select
+                    value={slot.deviceId}
+                    onClick={(event) => event.stopPropagation()}
+                    onChange={(event) => handleCameraSlotDeviceChange(slot.id, event.target.value)}
+                    className="h-7 min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900/90 px-2 text-[10px] font-bold text-slate-200 outline-none hover:border-cyan-700 focus:border-cyan-500"
+                    title={language === 'BM' ? 'Pilih kamera' : 'Choose camera'}
+                  >
+                    {(availableCameras.length > 0 ? availableCameras : [{ deviceId: '', label: slotLabel } as MediaDeviceInfo]).map(
+                      (cameraDevice, cameraIndex) => (
+                        <option key={cameraDevice.deviceId || `camera-${cameraIndex}`} value={cameraDevice.deviceId}>
+                          {cameraDevice.label || (cameraIndex === 0 ? slotLabel : `Camera ${cameraIndex + 1}`)}
+                        </option>
+                      )
+                    )}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleUseCamera(slot, index);
+                    }}
+                    className="h-7 rounded-lg border border-cyan-700 bg-cyan-950/90 px-2 text-[10px] font-bold text-cyan-200 hover:bg-cyan-900"
+                  >
+                    Preview
+                  </button>
+                  {cameraSlots.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleRemoveCamera(slot.id);
+                      }}
+                      className="h-7 w-7 rounded-lg border border-slate-700 bg-slate-900/90 text-slate-300 hover:border-red-700 hover:text-red-300"
+                      title={language === 'BM' ? 'Buang kamera' : 'Remove camera'}
+                    >
+                      <X className="mx-auto h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {isActiveSlot && (
+                  <div className="absolute bottom-2.5 left-2.5 bg-cyan-950/90 text-cyan-200 border border-cyan-500/60 rounded-lg px-2.5 py-1 text-[10px] font-bold">
+                    {supportsMultiCameraScan && isScanning ? 'Selected view' : 'Active scanner'}
+                  </div>
+                )}
+                {isScanningSlot && (
+                  <div className={`absolute bottom-2.5 ${isActiveSlot ? 'left-32' : 'left-2.5'} bg-slate-900/90 text-cyan-200 border border-cyan-700 rounded-lg px-2.5 py-1 text-[10px] font-mono font-black`}>
+                    {supportsMultiCameraScan && currentPlate === 'SCANNING' ? 'SCANNING' : currentPlate}
+                  </div>
+                )}
+                {supportsMultiCameraScan && (
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleAddCamera();
+                    }}
+                    disabled={cameraSlots.length >= 4}
+                    className="sm:hidden absolute bottom-2.5 right-2.5 z-20 inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-900/85 px-2.5 py-1 text-[10px] font-bold text-slate-300 disabled:opacity-40"
+                  >
+                    <Plus className="h-3 w-3" />
+                    <span>Add</span>
+                  </button>
+                )}
+                {isAlertSlot && activeAlertMatch && (
+                  <div className="scanner-alert-card absolute inset-1.5 z-30 bg-red-600 border-2 border-red-400 rounded-xl p-2.5 sm:p-4 shadow-2xl flex flex-col justify-between text-center overflow-hidden">
+                    <div className="flex items-center justify-between border-b border-red-500/80 pb-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <ShieldAlert className="w-4 h-4 text-white animate-bounce shrink-0" />
+                        <span className="text-[10px] sm:text-xs font-black uppercase text-white tracking-wider truncate">
+                          {language === 'BM' ? 'AMARAN: PADANAN DIKESAN' : 'ALERT: MATCH DETECTED'}
+                        </span>
+                      </div>
+                      <button
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setActiveAlertMatch(null);
+                        }}
+                        className="p-1 rounded-lg bg-red-700 hover:bg-red-800 text-white transition-all"
+                        title={t('closeBtn')}
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+
+                    <div className="bg-red-700 border border-red-400/50 rounded-lg p-2.5 sm:p-3 space-y-2 text-left shadow-inner">
+                      <div className="grid grid-cols-2 gap-2 border-b border-red-500/80 pb-2">
+                        <div>
+                          <span className="text-[9px] text-red-100 font-bold uppercase block">{t('plateNumber')}</span>
+                          <span className="plate-yellow text-base sm:text-xl font-mono font-black">
+                            {activeAlertMatch.vehicle.plate}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-[9px] text-red-100 font-bold uppercase block">{t('outstandingAmount')}</span>
+                          <span className="text-base sm:text-lg font-mono font-black text-white">
+                            {formatMYR(activeAlertMatch.vehicle.outstandingAmount)}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[10px] sm:text-xs">
+                        <div>
+                          <span className="text-red-100 block">{t('vehicleDetails')}</span>
+                          <strong className="text-white truncate block">
+                            {activeAlertMatch.vehicle.brand} {activeAlertMatch.vehicle.model}
+                          </strong>
+                        </div>
+                        <div>
+                          <span className="text-red-100 block">{language === 'BM' ? 'Kamera' : 'Camera'}</span>
+                          <strong className="text-white truncate block">{activeAlertMatch.cameraName}</strong>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-center gap-1.5 pt-2 border-t border-red-500/80">
+                      <button
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleMarkAsSeen();
+                        }}
+                        className="btn-mark-seen px-3 py-1.5 rounded-lg bg-white hover:bg-slate-100 text-red-600 text-[10px] sm:text-xs font-black uppercase tracking-wider flex items-center justify-center gap-1 shadow-md transition-all"
+                      >
+                        <BookmarkCheck className="w-3.5 h-3.5 text-red-600" />
+                        <span>{t('markAction')}</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {latestDetection && latestResultTone && (
+        <div
+          className={`rounded-2xl border p-3.5 sm:p-4 shadow-xl ${
+            latestResultTone === 'EXACT'
+              ? 'border-red-700 bg-red-950/35'
+              : latestResultTone === 'POSSIBLE'
+              ? 'border-amber-700 bg-amber-950/25'
+              : 'border-slate-800 bg-slate-900/90'
+          }`}
+        >
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="flex items-start gap-3 min-w-0">
+              <div
+                className={`mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border ${
+                  latestResultTone === 'EXACT'
+                    ? 'border-red-500 bg-red-600 text-white'
+                    : latestResultTone === 'POSSIBLE'
+                    ? 'border-amber-500 bg-amber-500 text-slate-950'
+                    : 'border-cyan-900 bg-slate-950 text-cyan-300'
+                }`}
               >
-                <div className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 ${resultStatus.iconClass}`}>
-                  {resultTrack.matchType === 'EXACT' ? (
-                    <AlertOctagon className="w-6 h-6" />
-                  ) : (
-                    <AlertTriangle className="w-6 h-6" />
-                  )}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="font-mono text-xl font-black tracking-widest text-white leading-tight">
-                    {resultPlateText}
-                  </div>
-                  <div className={`mt-1 inline-flex items-center px-2.5 py-1 rounded-full border text-xs font-black ${resultStatus.chipClass}`}>
-                    {resultStatus.label}
-                  </div>
-                </div>
-                <div className="text-slate-500 shrink-0">
-                  {trayExpanded ? <ChevronDown className="w-5 h-5" /> : <ChevronUp className="w-5 h-5" />}
-                </div>
-              </button>
-
-              {trayExpanded && (resultTrack.matchedVehicle || (resultTrack.possibleMatchVehicles?.length ?? 0) > 0) && (
-                <div className="border-t border-white/10 px-4 pb-3 text-xs">
-                  {resultTrack.matchedVehicle && (
-                    <div className="grid grid-cols-2 gap-2 pt-3">
-                      <div className="rounded-lg bg-black/30 p-2">
-                        <div className="text-slate-500">Customer</div>
-                        <div className="text-white font-bold truncate">{resultTrack.matchedVehicle.customerName}</div>
-                      </div>
-                      <div className="rounded-lg bg-black/30 p-2">
-                        <div className="text-slate-500">Vehicle</div>
-                        <div className="text-white font-bold truncate">
-                          {resultTrack.matchedVehicle.vehicleMake} {resultTrack.matchedVehicle.vehicleModel}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  {!resultTrack.matchedVehicle && (resultTrack.possibleMatchVehicles?.length ?? 0) > 0 && (
-                    <div className="pt-3 space-y-2">
-                      {resultTrack.possibleMatchVehicles?.slice(0, 2).map(v => (
-                        <div key={v.id} className="rounded-lg bg-black/30 p-2 flex items-center justify-between gap-2">
-                          <span className="font-mono font-bold text-white">{v.plateNumber}</span>
-                          <span className="text-slate-300 truncate">{v.vehicleMake} {v.vehicleModel}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* ── NEW BOTTOM NAVIGATION BAR (Mockup Layout) ── */}
-      <div className="flex-shrink-0 bg-[#090a0f] border-t border-[#252833] flex flex-col">
-        {/* STATUS INDICATOR */}
-        <div className="flex items-center gap-3 px-6 py-4 border-b border-[#252833]">
-          <div className={`w-2.5 h-2.5 rounded-full ${bottomStatus.dotClass}`} />
-          <span className={`${bottomStatus.textClass} text-xs font-bold tracking-widest uppercase`}>
-            {bottomStatus.label}
-          </span>
-        </div>
-        
-        {/* TAB BAR */}
-        <div className="flex items-center justify-around py-3">
-          <Link href="/" className="flex flex-col items-center gap-1.5 p-2 text-slate-500 hover:text-white transition-colors">
-            <LayoutGrid className="w-6 h-6" />
-            <span className="text-[10px] font-medium">Dashboard</span>
-          </Link>
-          <Link href="/search" className="flex flex-col items-center gap-1.5 p-2 text-slate-500 hover:text-white transition-colors">
-            <Search className="w-6 h-6" />
-            <span className="text-[10px] font-medium">Search</span>
-          </Link>
-          <div className="flex flex-col items-center gap-1.5 p-2 text-[#00d8f6]">
-            <Camera className="w-6 h-6" />
-            <span className="text-[10px] font-bold">Scanner</span>
-          </div>
-          <Link href="/manage" className="flex flex-col items-center gap-1.5 p-2 text-slate-500 hover:text-white transition-colors">
-            <Car className="w-6 h-6" />
-            <span className="text-[10px] font-medium">Manage</span>
-          </Link>
-        </div>
-      </div>
-
-      {/* ── MATCH DETAIL MODAL ── */}
-      {viewingMatch && (
-        <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div
-            className={`max-w-md w-full rounded-2xl p-6 shadow-2xl border-2 ${
-              viewingMatch.type === 'EXACT'
-                ? 'bg-rose-950/95 border-rose-600'
-                : 'bg-amber-950/95 border-amber-500'
-            }`}
-          >
-            <div className="flex items-center justify-between mb-4 pb-4 border-b border-white/10">
-              <div className="flex items-center gap-3">
-                {viewingMatch.type === 'EXACT'
-                  ? <AlertOctagon className="w-7 h-7 text-rose-400 animate-bounce" />
-                  : <AlertTriangle className="w-7 h-7 text-amber-400" />}
-                <div>
-                  <div className="text-[10px] font-black text-white/60 tracking-widest uppercase">Track #{viewingMatch.trackId.replace('trk-', '')}</div>
-                  <h2 className="text-xl font-black text-white">
-                    {viewingMatch.type === 'EXACT' ? 'MATCH FOUND' : 'POSSIBLE MATCH'}
-                  </h2>
-                </div>
+                {latestResultTone === 'EXACT' ? (
+                  <ShieldAlert className="h-5 w-5" />
+                ) : latestResultTone === 'POSSIBLE' ? (
+                  <AlertTriangle className="h-5 w-5" />
+                ) : (
+                  <XCircle className="h-5 w-5" />
+                )}
               </div>
-              <span className="text-xl font-mono font-black text-white bg-black/50 px-3 py-1 rounded-xl border border-white/20">
-                {viewingMatch.plate}
-              </span>
-            </div>
-
-            {viewingMatch.type === 'EXACT' && viewingMatch.vehicle && (
-              <div className="grid grid-cols-2 gap-2 mb-4 text-xs">
-                {[
-                  ['Pelanggan', viewingMatch.vehicle.customerName],
-                  ['Kenderaan', `${viewingMatch.vehicle.vehicleMake} ${viewingMatch.vehicle.vehicleModel} (${viewingMatch.vehicle.vehicleColor})`],
-                  ['Syarikat Kewangan', viewingMatch.vehicle.financeCompany],
-                  ['Rujukan Kes', viewingMatch.vehicle.caseReference],
-                ].map(([label, value]) => (
-                  <div key={label} className="bg-black/50 p-2.5 rounded-lg border border-white/5">
-                    <span className="text-slate-400 block mb-0.5">{label}</span>
-                    <span className="text-white font-semibold">{value}</span>
-                  </div>
-                ))}
-                <div className="col-span-2 bg-black/50 p-2.5 rounded-lg border border-rose-900/40">
-                  <span className="text-slate-400 block mb-0.5">Jumlah Tunggakan</span>
-                  <span className="text-rose-400 font-black text-lg">
-                    RM {viewingMatch.vehicle.outstandingAmount.toLocaleString('ms-MY', { minimumFractionDigits: 2 })}
-                  </span>
+              <div className="min-w-0">
+                <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+                  {language === 'BM' ? 'Keputusan Imbasan Terkini' : 'Latest Scanner Result'}
                 </div>
-              </div>
-            )}
-
-            {viewingMatch.type === 'POSSIBLE' && viewingMatch.possibleMatches.length > 0 && (
-              <div className="mb-4 text-xs space-y-2">
-                <p className="text-amber-200 mb-2">
-                  Nombor plat <span className="font-mono font-bold text-white">{viewingMatch.plate}</span> hampir sepadan. Sahkan secara visual.
+                <h2 className="text-sm sm:text-base font-black text-white uppercase tracking-wide">
+                  {latestResultTone === 'EXACT'
+                    ? language === 'BM'
+                      ? 'Padanan kes dijumpai'
+                      : 'Case match found'
+                    : latestResultTone === 'POSSIBLE'
+                    ? language === 'BM'
+                      ? 'Padanan berpotensi'
+                      : 'Possible match'
+                    : language === 'BM'
+                    ? 'Tiada padanan aktif'
+                    : 'No active match'}
+                </h2>
+                <p className="mt-1 text-[11px] sm:text-xs text-slate-400">
+                  {latestResultTone === 'EXACT' && latestExactVehicle
+                    ? `${latestExactVehicle.brand} ${latestExactVehicle.model} - ${latestExactVehicle.financeCompany}`
+                    : latestResultTone === 'POSSIBLE' && latestPossibleVehicles.length > 0
+                    ? `${language === 'BM' ? 'Semak calon:' : 'Review candidates:'} ${latestPossibleVehicles
+                        .map((vehicle) => vehicle.plate)
+                        .join(', ')}`
+                    : language === 'BM'
+                    ? 'Direkod untuk audit sahaja. Tiada amaran tindakan dikeluarkan.'
+                    : 'Logged for audit only. No action alert was raised.'}
                 </p>
-                {viewingMatch.possibleMatches.map(v => (
-                  <div key={v.id} className="bg-black/50 p-2.5 rounded-lg border border-amber-900/30">
-                    <div className="flex justify-between items-center">
-                      <span className="font-mono font-bold text-white">{v.plateNumber}</span>
-                      <span className="text-rose-400 font-bold">RM {v.outstandingAmount.toLocaleString('ms-MY', { minimumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="text-slate-300 mt-0.5">{v.customerName} · {v.vehicleMake} {v.vehicleModel} ({v.vehicleColor})</div>
-                  </div>
-                ))}
               </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 lg:min-w-[520px]">
+              <div className="rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
+                <div className="flex items-center gap-1.5 text-[9px] font-bold uppercase text-slate-500">
+                  <FileSearch className="h-3 w-3 text-cyan-400" />
+                  <span>{language === 'BM' ? 'Plat' : 'Plate'}</span>
+                </div>
+                <div className="mt-1 font-mono text-sm font-black text-cyan-300 truncate">{latestDetection.plate}</div>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
+                <div className="flex items-center gap-1.5 text-[9px] font-bold uppercase text-slate-500">
+                  <Activity className="h-3 w-3 text-cyan-400" />
+                  <span>{language === 'BM' ? 'Keyakinan' : 'Confidence'}</span>
+                </div>
+                <div className="mt-1 font-mono text-sm font-black text-slate-200">{latestDetection.confidence}%</div>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
+                <div className="flex items-center gap-1.5 text-[9px] font-bold uppercase text-slate-500">
+                  <Video className="h-3 w-3 text-cyan-400" />
+                  <span>{language === 'BM' ? 'Kamera' : 'Camera'}</span>
+                </div>
+                <div className="mt-1 text-xs font-bold text-slate-200 truncate">{latestDetection.cameraName}</div>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
+                <div className="flex items-center gap-1.5 text-[9px] font-bold uppercase text-slate-500">
+                  {latestResultTone === 'EXACT' ? (
+                    <DollarSign className="h-3 w-3 text-red-400" />
+                  ) : (
+                    <Car className="h-3 w-3 text-cyan-400" />
+                  )}
+                  <span>{latestResultTone === 'EXACT' ? t('outstandingAmount') : 'Status'}</span>
+                </div>
+                <div className="mt-1 text-xs font-black text-slate-200 truncate">
+                  {latestResultTone === 'EXACT' && latestExactVehicle
+                    ? formatMYR(latestExactVehicle.outstandingAmount)
+                    : latestResultTone === 'POSSIBLE'
+                    ? language === 'BM'
+                      ? 'Semakan'
+                      : 'Review'
+                    : language === 'BM'
+                    ? 'Jelas'
+                    : 'Clear'}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-slate-800/80 pt-3">
+            {latestResultTone === 'EXACT' && latestExactVehicle && (
+              <button
+                type="button"
+                onClick={() => handleMarkDetectionAction(latestDetection)}
+                className="inline-flex items-center justify-center gap-2 rounded-xl border border-red-600 bg-red-600 px-4 py-2 text-xs font-black uppercase text-white shadow-lg shadow-red-950/30 transition-colors hover:bg-red-500"
+              >
+                <BookmarkCheck className="h-4 w-4" />
+                <span>{t('markAction')}</span>
+              </button>
             )}
-
-            <div className="text-[10px] text-slate-400 mb-4">
-              Confidence: {Math.round(viewingMatch.confidence * 100)}% · Multi-vehicle scanner is running in background.
-            </div>
-
-            <div className="flex flex-wrap gap-2 justify-end">
-              <button
-                onClick={() => reportWrong(viewingMatch)}
-                className="px-3 py-2 bg-black/60 text-slate-300 border border-white/10 rounded-xl text-xs font-semibold hover:bg-black"
+            <Link
+              href={latestSearchHref}
+              className={`inline-flex items-center justify-center gap-2 rounded-xl border px-4 py-2 text-xs font-black uppercase transition-colors ${
+                latestResultTone === 'POSSIBLE'
+                  ? 'border-amber-700 bg-amber-950/70 text-amber-200 hover:bg-amber-900'
+                  : 'border-cyan-800 bg-cyan-950/70 text-cyan-200 hover:bg-cyan-900'
+              }`}
+            >
+              <SearchIcon className="h-4 w-4" />
+              <span>
+                {latestResultTone === 'POSSIBLE'
+                  ? language === 'BM'
+                    ? 'Semak Padanan'
+                    : 'Review Match'
+                  : language === 'BM'
+                  ? 'Carian Manual'
+                  : 'Manual Search'}
+              </span>
+            </Link>
+            {latestResultTone === 'NONE' && (
+              <Link
+                href="/vehicles"
+                className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-xs font-black uppercase text-slate-300 transition-colors hover:border-cyan-800 hover:text-cyan-200"
               >
-                Report Wrong Reading
-              </button>
-              <button
-                onClick={() => { setViewingMatch(null); }}
-                className="px-4 py-2 bg-slate-700 text-white rounded-xl text-xs font-semibold hover:bg-slate-600"
-              >
-                Continue Scanning
-              </button>
-              {viewingMatch.type === 'EXACT' && (
-                <button
-                  onClick={() => confirmVehicle(viewingMatch)}
-                  className="px-5 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black rounded-xl text-xs"
-                >
-                  Confirm Vehicle
-                </button>
-              )}
-            </div>
+                <Database className="h-4 w-4" />
+                <span>{language === 'BM' ? 'Pangkalan Data' : 'Vehicle DB'}</span>
+              </Link>
+            )}
           </div>
         </div>
       )}
+
+      <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3.5 sm:p-5 shadow-xl space-y-3">
+        <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
+          <div className="flex items-center gap-2">
+            <Activity className="w-4 h-4 text-cyan-400" />
+            <h2 className="text-xs sm:text-sm font-bold text-white uppercase tracking-wider">
+              {t('recentDetectionList')}
+            </h2>
+          </div>
+          <span className="text-[10px] font-mono text-slate-500">
+            {liveDetections.length} session scans
+          </span>
+        </div>
+
+        <div className="sm:hidden space-y-2">
+          {liveDetections.length > 0 ? (
+            liveDetections.map((det) => (
+              <button
+                key={det.id}
+                type="button"
+                onClick={() => setExpandedDetectionId((current) => (current === det.id ? null : det.id))}
+                className="w-full p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 text-left space-y-2 hover:border-cyan-900/70 transition-all"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="space-y-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono font-black text-cyan-300 text-xs">{det.plate}</span>
+                      <span className="text-[10px] text-slate-400 truncate">{det.cameraName}</span>
+                    </div>
+                    {det.matchType === 'EXACT' || det.matched ? (
+                      <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold uppercase bg-red-950 text-red-400 border border-red-700 inline-flex items-center gap-1">
+                        <CheckCircle2 className="w-2.5 h-2.5" />
+                        <span>TANDA TINDAKAN</span>
+                      </span>
+                    ) : det.matchType === 'POSSIBLE' ? (
+                      <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold uppercase bg-amber-950 text-amber-300 border border-amber-700 inline-flex items-center gap-1">
+                        <AlertTriangle className="w-2.5 h-2.5" />
+                        <span>POSSIBLE</span>
+                      </span>
+                    ) : (
+                      <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold uppercase bg-slate-900 text-slate-400 border border-slate-800 inline-flex items-center gap-1">
+                        <XCircle className="w-2.5 h-2.5" />
+                        <span>{language === 'BM' ? 'TIADA' : 'NO MATCH'}</span>
+                      </span>
+                    )}
+                  </div>
+                  <span className="text-[10px] font-mono text-slate-500 shrink-0">{det.timestamp}</span>
+                </div>
+                {expandedDetectionId === det.id && (
+                  <div className="grid grid-cols-1 gap-1 border-t border-slate-800 pt-2 text-[10px] text-slate-400">
+                    <div className="flex items-center gap-1.5">
+                      <MapPin className="h-3 w-3 text-cyan-400" />
+                      <span>{det.name}</span>
+                    </div>
+                    <div className="font-mono">GPS: {det.gps}</div>
+                  </div>
+                )}
+              </button>
+            ))
+          ) : (
+            <div className="py-5 text-center text-xs text-slate-500">No scans in this session yet.</div>
+          )}
+        </div>
+
+        <div className="hidden sm:block overflow-x-auto">
+          <table className="w-full text-left text-xs min-w-[560px]">
+            <thead className="bg-slate-950 text-slate-400 uppercase font-mono text-[9px] sm:text-[10px] border-b border-slate-800 whitespace-nowrap">
+              <tr>
+                <th className="py-2 px-3">{language === 'BM' ? 'Nombor Plat' : 'Plate Number'}</th>
+                <th className="py-2 px-3">Status</th>
+                <th className="py-2 px-3">Confidence</th>
+                <th className="py-2 px-3">{language === 'BM' ? 'Kamera' : 'Camera'}</th>
+                <th className="py-2 px-3 text-right">{language === 'BM' ? 'Masa' : 'Time'}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/60 font-mono whitespace-nowrap">
+              {liveDetections.length > 0 ? (
+                liveDetections.map((det) => (
+                  <React.Fragment key={det.id}>
+                    <tr
+                      onClick={() => setExpandedDetectionId((current) => (current === det.id ? null : det.id))}
+                      className="hover:bg-slate-800/40 transition-colors cursor-pointer"
+                    >
+                      <td className="py-2 px-3 font-black text-cyan-300 text-xs sm:text-sm">{det.plate}</td>
+                      <td className="py-2 px-3">
+                        {det.matchType === 'EXACT' || det.matched ? (
+                          <span className="px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold uppercase bg-red-950 text-red-400 border border-red-700 inline-flex items-center gap-1">
+                            <CheckCircle2 className="w-3 h-3" />
+                            <span>TANDA TINDAKAN</span>
+                          </span>
+                        ) : det.matchType === 'POSSIBLE' ? (
+                          <span className="px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold uppercase bg-amber-950 text-amber-300 border border-amber-700 inline-flex items-center gap-1">
+                            <AlertTriangle className="w-3 h-3" />
+                            <span>POSSIBLE</span>
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold uppercase bg-slate-950 text-slate-400 border border-slate-800 inline-flex items-center gap-1">
+                            <XCircle className="w-3 h-3" />
+                            <span>{language === 'BM' ? 'TIADA PADANAN' : 'UNMATCHED'}</span>
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-2 px-3 text-slate-300 text-[11px]">{det.confidence}%</td>
+                      <td className="py-2 px-3 text-slate-300 text-[11px]">{det.cameraName}</td>
+                      <td className="py-2 px-3 text-right text-slate-500 text-[10px] sm:text-[11px]">{det.timestamp}</td>
+                    </tr>
+                    {expandedDetectionId === det.id && (
+                      <tr className="bg-slate-950/70">
+                        <td colSpan={5} className="px-3 py-3">
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px] text-slate-400">
+                            <div className="flex items-center gap-1.5 md:col-span-2">
+                              <MapPin className="h-3.5 w-3.5 text-cyan-400" />
+                              <span className="text-slate-500">{language === 'BM' ? 'Lokasi Dijumpai:' : 'Found Location:'}</span>
+                              <span className="text-slate-300">{det.name}</span>
+                            </div>
+                            <div className="font-mono text-slate-300">GPS: {det.gps}</div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan={5} className="py-8 text-center text-slate-500 font-sans">
+                    No scans in this session yet. Start scanning to populate dashboard and audit history.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 }

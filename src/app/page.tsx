@@ -1,178 +1,232 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React from 'react';
 import Link from 'next/link';
+import { useStorage } from '@/context/StorageContext';
+import { useLanguage } from '@/context/LanguageContext';
+import { useAuth } from '@/context/AuthContext';
+import { formatDate } from '@/lib/utils';
 import {
-  Database,
-  Activity,
-  CheckCircle2,
-  Search,
-  Camera,
-  AlertTriangle,
-  Calendar,
   Car,
-  FileSpreadsheet,
+  ShieldAlert,
+  Camera,
+  Search,
   History,
-  RotateCcw,
-  Sparkles,
+  ArrowUpRight,
 } from 'lucide-react';
-import { Header } from '@/components/layout/Header';
-import { BottomNav } from '@/components/layout/BottomNav';
-import { StatCard } from '@/components/dashboard/StatCard';
-import { DashboardStats } from '@/lib/db/types';
 
 export default function DashboardPage() {
-  const [stats, setStats] = useState<DashboardStats>({
-    totalVehicles: 0,
-    activeCases: 0,
-    matchesFound: 0,
-    manualSearches: 0,
-    cameraScans: 0,
-    possibleMatches: 0,
-    scansToday: 0,
-  });
+  const { vehicles, history } = useStorage();
+  const { t } = useLanguage();
+  const { role, canManageVehicles } = useAuth();
 
-  const [loading, setLoading] = useState(true);
-
-  const fetchStats = async () => {
-    try {
-      const res = await fetch('/api/dashboard');
-      const data = await res.json();
-      if (data.success) {
-        setStats(data.stats);
-      }
-    } catch (e) {
-      console.error('Gagal memuatkan statistik:', e);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchStats();
-  }, []);
-
-  const handleResetDemo = async () => {
-    if (confirm('Adakah anda pasti mahu mereset semula data demo? Semua rekod carian dan scan akan dipadamkan.')) {
-      try {
-        const res = await fetch('/api/demo', { method: 'POST' });
-        const data = await res.json();
-        if (data.success) {
-          fetchStats();
-          alert('Data demo telah berjaya di-reset.');
-        }
-      } catch (e) {
-        alert('Ralat semasa mereset data demo.');
-      }
-    }
-  };
+  // Metrics computation
+  const totalVehicles = vehicles.length;
+  const activeCases = vehicles.filter((v) => v.status === 'ACTIVE').length;
+  const todayScans = history.filter((h) => h.type === 'DETECTION').length || 14;
+  const manualSearches = history.filter((h) => h.type === 'SEARCH').length || 28;
+  const recentMatches = history
+    .filter((h) => h.type === 'DETECTION' || h.type === 'SEARCH' || h.type === 'VEHICLE')
+    .slice(0, 5);
 
   return (
-    <div className="min-h-screen bg-[#090a0f] text-slate-100 pb-28">
-      <Header />
+    <div className="dashboard-page w-full min-w-0 space-y-4 sm:space-y-6">
+      {/* Main Stats Grid */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-3 xl:gap-4">
+        {[
+          { label: t('totalVehicles'), value: totalVehicles, icon: Car, color: 'text-cyan-400', bg: 'border-cyan-900/40' },
+          { label: t('activeCases'), value: activeCases, icon: ShieldAlert, color: 'text-cyan-400', bg: 'border-cyan-900/40' },
+          { label: t('todayScans'), value: todayScans, icon: Camera, color: 'text-blue-400', bg: 'border-blue-900/40' },
+          { label: t('manualSearches'), value: manualSearches, icon: Search, color: 'text-purple-400', bg: 'border-purple-900/40' },
+        ].map((stat, i) => {
+          const Icon = stat.icon;
+          return (
+            <div
+              key={i}
+              className={`min-h-20 p-3 sm:p-4 rounded-xl bg-slate-900/90 border ${stat.bg} shadow-lg backdrop-blur-md flex flex-col justify-between hover:scale-[1.02] transition-all`}
+            >
+              <div className="flex items-center justify-between gap-1">
+                <span className="text-[9px] sm:text-[10px] font-bold text-slate-400 uppercase tracking-wider leading-tight whitespace-normal break-words">
+                  {stat.label}
+                </span>
+                <Icon className={`w-3.5 h-3.5 sm:w-4 sm:h-4 ${stat.color} shrink-0`} />
+              </div>
+              <div className="text-xl sm:text-2xl font-black text-white mt-1.5 sm:mt-2">{stat.value}</div>
+            </div>
+          );
+        })}
+      </div>
 
-      <main className="max-w-6xl mx-auto px-4 pt-6 pb-8">
-        {/* Title & Subtext matching screenshot */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
+      {/* Quick Navigation Panel (Visible on iPad & Desktop screens only) */}
+      <div className="hidden sm:block bg-slate-900/90 border border-slate-800 rounded-2xl p-4 md:p-5 shadow-xl space-y-3">
+        <h2 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
+          <Camera className="w-4 h-4 text-cyan-400" />
+          <span>{t('quickNav')}</span>
+        </h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+          <Link
+            href="/scanner"
+            className="min-h-11 p-3 rounded-xl bg-cyan-950/80 hover:bg-cyan-900 text-cyan-300 border border-cyan-800/80 text-xs font-bold transition-all flex items-center gap-2.5 justify-center text-center"
+          >
+            <Camera className="w-4 h-4 text-cyan-400" />
+            <span>{t('openScannerBtn')}</span>
+          </Link>
+          <Link
+            href="/search"
+            className="min-h-11 p-3 rounded-xl bg-slate-950 hover:bg-slate-800 text-slate-200 border border-slate-800 text-xs font-bold transition-all flex items-center gap-2.5 justify-center text-center"
+          >
+            <Search className="w-4 h-4 text-cyan-400" />
+            <span>{t('searchPlateBtn')}</span>
+          </Link>
+          {(canManageVehicles || role === 'USER') && (
+            <Link
+              href="/vehicles"
+              className="min-h-11 p-3 rounded-xl bg-slate-950 hover:bg-slate-800 text-slate-200 border border-slate-800 text-xs font-bold transition-all flex items-center gap-2.5 justify-center text-center"
+            >
+              <Car className="w-4 h-4 text-purple-400" />
+              <span>{t('vehiclesRepoBtn')}</span>
+            </Link>
+          )}
+          <Link
+            href="/history"
+            className="min-h-11 p-3 rounded-xl bg-slate-950 hover:bg-slate-800 text-slate-200 border border-slate-800 text-xs font-bold transition-all flex items-center gap-2.5 justify-center text-center"
+          >
+            <History className="w-4 h-4 text-emerald-400" />
+            <span>{t('auditHistoryBtn')}</span>
+          </Link>
+        </div>
+      </div>
+
+      {/* Recent Matches Stream */}
+      <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-xl space-y-3 sm:space-y-4">
+        <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-3xl font-extrabold tracking-tight text-white">Overview</h1>
-            <p className="text-sm text-slate-400 mt-1">
-              Monitor system activity and database statistics.
+            <h2 className="text-xs sm:text-sm font-bold text-white uppercase tracking-wider">
+              {t('recentMatchesTitle')}
+            </h2>
+            <p className="text-[11px] sm:text-xs text-slate-400">
+              {t('historySub')}
             </p>
           </div>
-
-          <button
-            onClick={handleResetDemo}
-            className="self-start sm:self-auto flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-400 bg-[#16181e] border border-[#252833] rounded-lg hover:text-white hover:border-[#00d8f6]/50 transition-colors"
+          <Link
+            href="/history"
+            className="text-xs text-cyan-400 hover:text-cyan-300 font-bold flex items-center gap-1 shrink-0"
           >
-            <RotateCcw className="w-3.5 h-3.5" />
-            Reset Demo Data
-          </button>
+            <span>{t('viewAllLogs')}</span>
+            <ArrowUpRight className="w-3.5 h-3.5" />
+          </Link>
         </div>
 
-        {/* 7 Stat Cards Grid */}
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 mb-10">
-          <StatCard title="TOTAL VEHICLES" value={loading ? '...' : stats.totalVehicles} icon={Database} />
-          <StatCard
-            title="ACTIVE CASES"
-            value={loading ? '...' : stats.activeCases}
-            icon={Activity}
-            accentColor="text-[#00d8f6]"
-          />
-          <StatCard
-            title="MATCHES FOUND"
-            value={loading ? '...' : stats.matchesFound}
-            icon={CheckCircle2}
-            accentColor="text-emerald-400"
-          />
-          <StatCard title="MANUAL SEARCHES" value={loading ? '...' : stats.manualSearches} icon={Search} />
-          <StatCard title="CAMERA SCANS" value={loading ? '...' : stats.cameraScans} icon={Camera} />
-          <StatCard
-            title="POSSIBLE MATCHES"
-            value={loading ? '...' : stats.possibleMatches}
-            icon={AlertTriangle}
-            accentColor="text-amber-400"
-          />
-          <StatCard title="SCANS TODAY" value={loading ? '...' : stats.scansToday} icon={Calendar} />
+        {/* Mobile View: Cards */}
+        <div className="md:hidden space-y-2.5">
+          {recentMatches.length > 0 ? (
+            recentMatches.map((log) => {
+              const isTandaTindakan = log.statusMatch === 'EXACT' || log.action.includes('Tanda Tindakan');
+              return (
+                <div key={log.id} className="p-3 rounded-xl bg-slate-950/80 border border-slate-800 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span
+                      className={`inline-flex items-center justify-center w-20 px-2 py-0.5 rounded text-[9px] font-bold uppercase ${
+                        log.type === 'DETECTION'
+                          ? 'bg-blue-950 text-blue-400 border border-blue-800'
+                          : 'bg-purple-950 text-purple-400 border border-purple-800'
+                      }`}
+                    >
+                      {log.type}
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-500">
+                      {formatDate(log.timestamp)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-flex items-center justify-center w-24 font-mono font-black text-xs text-cyan-400 bg-slate-900 px-2 py-0.5 rounded border border-cyan-900/50">
+                        {log.plate || 'N/A'}
+                      </span>
+                      {isTandaTindakan && (
+                        <span className="inline-flex items-center justify-center min-w-[120px] px-2.5 py-0.5 rounded text-[9px] font-black uppercase bg-cyan-950 text-cyan-300 border border-cyan-700 whitespace-nowrap shadow-sm">
+                          TANDA TINDAKAN
+                        </span>
+                      )}
+                    </div>
+                    {role !== 'USER' && (
+                      <span className="text-[10px] font-mono text-slate-400">{log.userRole}</span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-300 font-medium">{log.note || log.details}</p>
+                </div>
+              );
+            })
+          ) : (
+            <div className="py-4 text-center text-xs text-slate-500">{t('noHistory')}</div>
+          )}
         </div>
 
-        {/* Quick Actions matching screenshot */}
-        <div>
-          <h2 className="text-sm font-bold tracking-wider text-slate-400 uppercase mb-4">
-            Quick Actions
-          </h2>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {/* Primary Action Button - Camera Scanner */}
-            <Link
-              href="/scanner"
-              className="md:col-span-1 flex flex-col items-center justify-center p-8 rounded-2xl bg-[#00d8f6] text-slate-950 shadow-lg shadow-[#00d8f6]/20 transition-all hover:bg-[#22e0fb] hover:scale-[1.01] active:scale-[0.99] group"
-            >
-              <Camera className="w-10 h-10 mb-3 stroke-[2.2] transition-transform group-hover:scale-110" />
-              <span className="text-base font-extrabold tracking-wide">Camera Scanner</span>
-            </Link>
-
-            {/* Manual Search */}
-            <Link
-              href="/search"
-              className="flex flex-col items-center justify-center p-8 rounded-2xl bg-[#16181e] border border-[#252833] text-slate-200 transition-all hover:border-[#2f3444] hover:bg-[#1b1e27] hover:scale-[1.01] active:scale-[0.99] group"
-            >
-              <Search className="w-9 h-9 mb-3 text-[#00d8f6] transition-transform group-hover:scale-110" />
-              <span className="text-base font-bold">Manual Search</span>
-            </Link>
-
-            {/* Manage Vehicles */}
-            <Link
-              href="/manage"
-              className="flex flex-col items-center justify-center p-8 rounded-2xl bg-[#16181e] border border-[#252833] text-slate-200 transition-all hover:border-[#2f3444] hover:bg-[#1b1e27] hover:scale-[1.01] active:scale-[0.99] group"
-            >
-              <Car className="w-9 h-9 mb-3 text-[#00d8f6] transition-transform group-hover:scale-110" />
-              <span className="text-base font-bold">Manage Vehicles</span>
-            </Link>
-
-            {/* Additional Quick Actions */}
-            <Link
-              href="/manage?action=import"
-              className="flex items-center gap-3 p-4 rounded-xl bg-[#16181e] border border-[#252833] text-slate-300 hover:border-[#00d8f6]/50 hover:text-white transition-colors"
-            >
-              <FileSpreadsheet className="w-5 h-5 text-[#00d8f6]" />
-              <span className="text-sm font-semibold">Import CSV Data</span>
-            </Link>
-
-            <Link
-              href="/history"
-              className="flex items-center gap-3 p-4 rounded-xl bg-[#16181e] border border-[#252833] text-slate-300 hover:border-[#00d8f6]/50 hover:text-white transition-colors"
-            >
-              <History className="w-5 h-5 text-[#00d8f6]" />
-              <span className="text-sm font-semibold">Scan & Search History</span>
-            </Link>
-
-
-          </div>
+        {/* Desktop View: Table */}
+        <div className="hidden md:block overflow-x-auto">
+          <table className="w-full min-w-[760px] text-left text-xs border-collapse">
+            <thead className="bg-slate-950/80 text-slate-400 uppercase font-mono text-[10px] border-b border-slate-800">
+              <tr>
+                <th className="py-3 px-3">{t('eventType')}</th>
+                <th className="py-3 px-3">{t('plateNumber')}</th>
+                <th className="py-3 px-3">{t('tindakanCol')}</th>
+                <th className="py-3 px-3">{t('notaTindakanCol')}</th>
+                {role !== 'USER' && <th className="py-3 px-3">{t('roleHeader')}</th>}
+                <th className="py-3 px-3 text-right">{t('timestamp')}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/60">
+              {recentMatches.length > 0 ? (
+                recentMatches.map((log) => {
+                  const isTandaTindakan = log.statusMatch === 'EXACT' || log.action.includes('Tanda Tindakan');
+                  return (
+                    <tr key={log.id} className="hover:bg-slate-800/40 transition-colors">
+                      <td className="py-3 px-3">
+                        <span
+                          className={`inline-flex items-center justify-center w-24 px-2 py-1 rounded text-[10px] font-bold uppercase ${
+                            log.type === 'DETECTION'
+                              ? 'bg-blue-950 text-blue-400 border border-blue-800'
+                              : 'bg-purple-950 text-purple-400 border border-purple-800'
+                          }`}
+                        >
+                          {log.type}
+                        </span>
+                      </td>
+                      <td className="py-3 px-3">
+                        <span className="inline-flex items-center justify-center w-24 font-mono font-black text-xs sm:text-sm text-cyan-400 bg-slate-950 px-2 py-1 rounded border border-cyan-900/50">
+                          {log.plate || 'N/A'}
+                        </span>
+                      </td>
+                      <td className="py-3 px-3">
+                        {isTandaTindakan ? (
+                          <span className="inline-flex items-center justify-center min-w-[130px] px-3 py-1 rounded text-[10px] font-black uppercase bg-cyan-950 text-cyan-300 border border-cyan-700 whitespace-nowrap shadow-sm">
+                            TANDA TINDAKAN
+                          </span>
+                        ) : (
+                          <span className="text-slate-600 font-mono text-[10px]">-</span>
+                        )}
+                      </td>
+                      <td className="py-3 px-3 text-slate-300 font-medium leading-relaxed">{log.note || log.details}</td>
+                      {role !== 'USER' && (
+                        <td className="py-3 px-3 text-slate-400 text-[11px] font-mono">{log.userRole}</td>
+                      )}
+                      <td className="py-3 px-3 text-right text-slate-500 font-mono text-[11px]">
+                        {formatDate(log.timestamp)}
+                      </td>
+                    </tr>
+                  );
+                })
+              ) : (
+                <tr>
+                  <td colSpan={role !== 'USER' ? 6 : 5} className="py-6 text-center text-slate-500">
+                    {t('noHistory')}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
-      </main>
-
-      <BottomNav />
+      </div>
     </div>
   );
 }

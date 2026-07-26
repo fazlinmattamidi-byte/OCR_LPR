@@ -3,12 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "npm --prefix \"FULL UI DESIGN\" run dev -- -H 0.0.0.0",
-    "dev:https": "npm --prefix \"FULL UI DESIGN\" run dev -- --experimental-https -H 0.0.0.0",
-    "build": "npm --prefix \"FULL UI DESIGN\" run build && node scripts/stage-vercel-output.mjs",
-    "start": "npm --prefix \"FULL UI DESIGN\" run start",
-    "lint": "npm --prefix \"FULL UI DESIGN\" run lint",
-    "dev:legacy": "next dev -H 0.0.0.0",
+    "dev": "next dev -H 0.0.0.0",
+    "dev:https": "next dev --experimental-https -H 0.0.0.0",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
     "test": "vitest run"
   },
   "dependencies": {
