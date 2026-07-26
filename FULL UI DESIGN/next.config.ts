@@ -30,10 +30,19 @@ function copyOnnxWasm() {
 
 copyOnnxWasm();
 
+function resolveTurbopackRoot() {
+  const projectRoot = process.cwd();
+  const repoRoot = path.dirname(projectRoot);
+  const localNextPackage = path.join(projectRoot, 'node_modules', 'next', 'package.json');
+  const repoNextPackage = path.join(repoRoot, 'node_modules', 'next', 'package.json');
+
+  return fs.existsSync(localNextPackage) || !fs.existsSync(repoNextPackage) ? projectRoot : repoRoot;
+}
+
 const nextConfig: NextConfig = {
   reactStrictMode: false,
   turbopack: {
-    root: process.cwd(),
+    root: resolveTurbopackRoot(),
   },
   async headers() {
     return [
