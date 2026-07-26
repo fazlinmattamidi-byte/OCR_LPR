@@ -33,14 +33,23 @@ export function formatDate(isoString: string): string {
   if (!isoString) return '-';
   try {
     const d = new Date(isoString);
-    return d.toLocaleString('en-GB', {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kuala_Lumpur',
       day: '2-digit',
       month: 'short',
       year: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
-    });
+      hourCycle: 'h23',
+    })
+      .formatToParts(d)
+      .reduce<Record<string, string>>((acc, part) => {
+        if (part.type !== 'literal') acc[part.type] = part.value;
+        return acc;
+      }, {});
+
+    return `${parts.day} ${parts.month} ${parts.year}, ${parts.hour}:${parts.minute}:${parts.second}`;
   } catch {
     return isoString;
   }

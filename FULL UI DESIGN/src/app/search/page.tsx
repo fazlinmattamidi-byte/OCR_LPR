@@ -1,6 +1,6 @@
 'use client';
 
-import React, { Fragment, useState } from 'react';
+import React, { Fragment, useEffect, useState } from 'react';
 import { useStorage } from '@/context/StorageContext';
 import { useLanguage } from '@/context/LanguageContext';
 import { useAuth } from '@/context/AuthContext';
@@ -52,11 +52,13 @@ export default function SearchPage() {
     setInputQuery(cleanPlateNumber(e.target.value));
   };
 
-  const handleSearch = (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (!inputQuery.trim()) return;
+  const executeSearch = (query: string) => {
+    const cleanedQuery = cleanPlateNumber(query);
+    if (!cleanedQuery.trim()) return;
 
-    const { exactMatch, possibleMatches } = searchVehicles(inputQuery);
+    setInputQuery(cleanedQuery);
+
+    const { exactMatch, possibleMatches } = searchVehicles(cleanedQuery);
     
     // Automatically update vehicle status to FLAGGED in Vehicle Management when matched
     if (exactMatch) {
@@ -85,8 +87,8 @@ export default function SearchPage() {
     } else if (possibleMatches.length > 0) {
       addHistoryLog({
         type: 'SEARCH',
-        action: `Manual Search: ${inputQuery}`,
-        plate: inputQuery,
+        action: `Manual Search: ${cleanedQuery}`,
+        plate: cleanedQuery,
         details: `Possible Matches Found (${possibleMatches.length})`,
         userRole: role,
         statusMatch: 'POSSIBLE',
@@ -94,13 +96,27 @@ export default function SearchPage() {
     } else {
       addHistoryLog({
         type: 'SEARCH',
-        action: `Manual Search: ${inputQuery}`,
-        plate: inputQuery,
+        action: `Manual Search: ${cleanedQuery}`,
+        plate: cleanedQuery,
         details: `No Match Found`,
         userRole: role,
         statusMatch: 'NONE',
       });
     }
+  };
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const plateParam = cleanPlateNumber(new URLSearchParams(window.location.search).get('plate') || '');
+      if (plateParam) executeSearch(plateParam);
+    }, 50);
+
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  const handleSearch = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    executeSearch(inputQuery);
   };
 
   const handleMarkAction = () => {
