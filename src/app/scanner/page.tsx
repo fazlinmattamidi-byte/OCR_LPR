@@ -783,6 +783,8 @@ const OCR_FIRST_READ_MIN_QUALITY = 0.24;
 const OCR_REPEAT_READ_MIN_QUALITY = 0.20;
 const OCR_MAX_CONCURRENCY = 4;
 const OCR_NO_MATCH_COMMIT_MIN_CONFIDENCE = 0.50;
+const OCR_QUICK_DB_MIN_SCORE = 0.58;
+const OCR_QUICK_DB_MIN_CONFIDENCE = 0.26;
 const MOTION_NORMAL_MAX = 0.15;
 const MOTION_UNSTABLE_MAX = 0.30;
 const MOTION_COLLECT_ONLY_MAX = 0.50;
@@ -910,6 +912,19 @@ function canCommitNoMatchOutcome(text: string, confidence: number, score: number
   if (text.length >= 5 && digits < 2) return false;
 
   return pattern.isValid || pattern.score >= 0.45;
+}
+
+function canCommitQuickDatabaseOutcome(text: string, confidence: number, score: number, voteCount: number): boolean {
+  const pattern = validateMalaysianPattern(text);
+  const { letters, digits } = countPlateChars(text);
+
+  if (text.length < 4 || letters === 0 || digits === 0) return false;
+  if (digits < 2 && pattern.score < 0.7) return false;
+  if (!pattern.isValid && pattern.score < 0.65) return false;
+
+  if (voteCount >= 2 && Math.max(confidence, score) >= 0.42) return true;
+
+  return confidence >= OCR_QUICK_DB_MIN_CONFIDENCE && score >= OCR_QUICK_DB_MIN_SCORE;
 }
 
 function getTrackVoteCount(track: ActiveTrack): number {
@@ -1788,6 +1803,13 @@ export default function ScannerPage() {
       const possibleVehicles = evaluation.possibleMatches
         .map((possibleVehicle) => vehiclesRef.current.find((vehicle) => vehicle.id === possibleVehicle.id) || null)
         .filter((vehicle): vehicle is Vehicle => Boolean(vehicle));
+
+      if (evaluation.matchType === 'INSUFFICIENT_CONFIDENCE') {
+        track.ocrState = 'CONSENSUS_BUILDING';
+        track.pipelineState = 'CONSENSUS';
+        return;
+      }
+
       const resolvedMatchType =
         evaluation.matchType === 'EXACT' && matchedVehicle
           ? 'EXACT'
@@ -2403,6 +2425,7 @@ export default function ScannerPage() {
                 updatedTrack.ocrState = 'CONSENSUS_BUILDING';
                 updatedTrack.pipelineState = 'CONSENSUS';
 
+                const acceptedVoteCount = getTrackVoteCount(updatedTrack);
                 const { digits } = countPlateChars(text);
                 const canFastMatch = bestPatternValid && digits >= (text.length >= 5 ? 2 : 1);
                 const veryStrongRead =
@@ -2440,6 +2463,13 @@ export default function ScannerPage() {
                   );
                   await runDatabaseMatch(updatedTrack, consensus.normalizedPlate, matchConfidence, sourceSlotId, {
                     commitNoCase: finalOutcomeReady || noMatchOutcomeReady,
+                  });
+                } else if (canCommitQuickDatabaseOutcome(text, conf, bestScore, acceptedVoteCount)) {
+                  const quickMatchConfidence = Math.max(conf, Math.min(0.98, bestScore));
+                  updatedTrack.stabilizedPlate = text;
+                  updatedTrack.stabilizedConfidence = quickMatchConfidence;
+                  await runDatabaseMatch(updatedTrack, text, quickMatchConfidence, sourceSlotId, {
+                    commitNoCase: true,
                   });
                 }
               } else if (updatedTrack.votes.size === 0) {
