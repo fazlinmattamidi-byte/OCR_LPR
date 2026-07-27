@@ -61,8 +61,9 @@ export function canUseWebGpuExecutionProvider(): boolean {
   const isSafari =
     /Safari/i.test(userAgent) &&
     !/Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS|Android/i.test(userAgent);
+  const isAndroid = /Android/i.test(userAgent);
 
-  return !isIOS && !isSafari;
+  return !isAndroid && !isIOS && !isSafari;
 }
 
 function loadScript(src: string): Promise<void> {

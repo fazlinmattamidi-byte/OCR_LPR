@@ -12,17 +12,12 @@ import {
   AlertTriangle,
   ArrowLeft,
   BookmarkCheck,
-  Car,
   CheckCircle2,
-  Database,
   Download,
-  DollarSign,
-  FileSearch,
   MapPin,
   Pause,
   Play,
   Plus,
-  Search as SearchIcon,
   ShieldAlert,
   Video,
   Volume2,
@@ -108,6 +103,8 @@ type DeviceTier = 'A' | 'B' | 'C' | 'D';
 
 type MotionBucket = 'NORMAL' | 'UNSTABLE' | 'COLLECT_ONLY' | 'PAUSED';
 
+type PerformanceMode = 'STANDARD' | 'ANDROID_OPTIMIZED' | 'THERMAL_SAVER' | 'SURVIVAL';
+
 type ScannerRuntimeMetrics = {
   sessionStartedAt: number;
   detectorLatencyTotalMs: number;
@@ -132,7 +129,15 @@ type ScannerRuntimeMetrics = {
   lastOcrQueueDepth: number;
   maxOcrQueueDepth: number;
   motionBuckets: Record<MotionBucket, number>;
+  baseDeviceTier: DeviceTier;
   deviceTier: DeviceTier;
+  adaptationLevel: number;
+  performanceMode: PerformanceMode;
+  performanceModeReason: string;
+  executionMode: string;
+  cameraProfile: string;
+  processingProfile: string;
+  ocrProfile: string;
   memoryBaselineMb?: number;
   memoryCurrentMb?: number;
 };
@@ -241,10 +246,84 @@ function getUsedHeapMb(): number | undefined {
   return typeof bytes === 'number' ? Math.round((bytes / 1024 / 1024) * 10) / 10 : undefined;
 }
 
+function downgradeDeviceTier(tier: DeviceTier, levels: number): DeviceTier {
+  const tiers: DeviceTier[] = ['A', 'B', 'C', 'D'];
+  const currentIndex = Math.max(0, tiers.indexOf(tier));
+  return tiers[Math.min(tiers.length - 1, currentIndex + Math.max(0, levels))];
+}
+
+function getPerformanceMode(baseTier: DeviceTier, effectiveTier: DeviceTier, adaptationLevel: number): PerformanceMode {
+  if (adaptationLevel >= 3 || effectiveTier === 'D') return 'SURVIVAL';
+  if (adaptationLevel > 0 || effectiveTier !== baseTier) return 'THERMAL_SAVER';
+  if (isAndroidDevice()) return 'ANDROID_OPTIMIZED';
+  return 'STANDARD';
+}
+
+function getExecutionModeLabel(): string {
+  if (isAndroidDevice()) return 'WASM';
+  return 'AUTO';
+}
+
+function getCameraProfileValues(adaptationLevel = 0): { width: number; height: number; fps: number } {
+  const android = isAndroidDevice();
+  const constrainedAndroid = isConstrainedAndroidDevice();
+
+  if (android || adaptationLevel > 0) {
+    const level = Math.max(adaptationLevel, constrainedAndroid ? 1 : 0);
+    return {
+      width: level >= 3 ? 480 : level >= 2 ? 560 : constrainedAndroid ? 640 : 720,
+      height: level >= 3 ? 360 : level >= 2 ? 420 : constrainedAndroid ? 480 : 540,
+      fps: level >= 3 ? 10 : level >= 2 ? 12 : constrainedAndroid ? 12 : 15,
+    };
+  }
+
+  return { width: 1280, height: 720, fps: 30 };
+}
+
+function getCameraProfileLabel(tier: DeviceTier, adaptationLevel = 0): string {
+  const { width, height, fps } = getCameraProfileValues(adaptationLevel);
+  return `${width}x${height} @ ${fps} FPS (Tier ${tier})`;
+}
+
+function getProcessingProfileLabel(tier: DeviceTier, adaptationLevel = 0): string {
+  const maxLongEdge = getProcessingMaxLongEdge(tier, adaptationLevel);
+  return `max ${maxLongEdge}px long edge`;
+}
+
+function getOcrProfileLabel(tier: DeviceTier, adaptationLevel = 0): string {
+  const variants =
+    adaptationLevel >= 2 || tier === 'D'
+      ? 1
+      : tier === 'A'
+      ? 6
+      : tier === 'B'
+      ? 3
+      : 2;
+  return `${getTierOcrConcurrencyLimit(tier)} job(s), ${variants} variant(s)`;
+}
+
+function applyRuntimePerformanceProfile(
+  metrics: ScannerRuntimeMetrics,
+  baseTier: DeviceTier,
+  adaptationLevel = metrics.adaptationLevel,
+  reason = metrics.performanceModeReason
+): void {
+  const boundedLevel = clampNumber(adaptationLevel, 0, 3);
+  const effectiveTier = downgradeDeviceTier(baseTier, boundedLevel);
+  metrics.baseDeviceTier = baseTier;
+  metrics.deviceTier = effectiveTier;
+  metrics.adaptationLevel = boundedLevel;
+  metrics.performanceMode = getPerformanceMode(baseTier, effectiveTier, boundedLevel);
+  metrics.performanceModeReason = reason;
+  metrics.executionMode = getExecutionModeLabel();
+  metrics.cameraProfile = getCameraProfileLabel(effectiveTier, boundedLevel);
+  metrics.processingProfile = getProcessingProfileLabel(effectiveTier, boundedLevel);
+  metrics.ocrProfile = getOcrProfileLabel(effectiveTier, boundedLevel);
+}
+
 function createInitialRuntimeMetrics(deviceTier: DeviceTier = 'B'): ScannerRuntimeMetrics {
   const memoryBaselineMb = getUsedHeapMb();
-
-  return {
+  const metrics: ScannerRuntimeMetrics = {
     sessionStartedAt: Date.now(),
     detectorLatencyTotalMs: 0,
     detectorLatencySamples: 0,
@@ -273,10 +352,21 @@ function createInitialRuntimeMetrics(deviceTier: DeviceTier = 'B'): ScannerRunti
       COLLECT_ONLY: 0,
       PAUSED: 0,
     },
+    baseDeviceTier: deviceTier,
     deviceTier,
+    adaptationLevel: 0,
+    performanceMode: getPerformanceMode(deviceTier, deviceTier, 0),
+    performanceModeReason: isAndroidDevice() ? 'Android optimized baseline' : 'Baseline profile',
+    executionMode: getExecutionModeLabel(),
+    cameraProfile: getCameraProfileLabel(deviceTier, 0),
+    processingProfile: getProcessingProfileLabel(deviceTier, 0),
+    ocrProfile: getOcrProfileLabel(deviceTier, 0),
     memoryBaselineMb,
     memoryCurrentMb: memoryBaselineMb,
   };
+
+  applyRuntimePerformanceProfile(metrics, deviceTier, 0, metrics.performanceModeReason);
+  return metrics;
 }
 
 function createMetricsSnapshot(
@@ -405,17 +495,99 @@ function createSystemHealthSnapshot(
   return { overallScore, components };
 }
 
+function getSampleAverage(samples: number[], count: number, offsetFromEnd = 0): number {
+  const end = Math.max(0, samples.length - offsetFromEnd);
+  const start = Math.max(0, end - count);
+  const slice = samples.slice(start, end);
+  if (slice.length === 0) return 0;
+  return slice.reduce((sum, value) => sum + value, 0) / slice.length;
+}
+
+function getRuntimeAdaptationReason(
+  snapshot: ScannerMetricsSnapshot,
+  detectorFps: number,
+  cameraFps: number
+): string | null {
+  const detectorTargetMs = getTierDetectorTargetMs(snapshot.deviceTier);
+  const recentDetectorAvg = getSampleAverage(snapshot.detectorLatencyHistoryMs, 12);
+  const previousDetectorAvg = getSampleAverage(snapshot.detectorLatencyHistoryMs, 12, 12);
+  const recentOcrAvg = getSampleAverage(snapshot.ocrLatencyHistoryMs, 8);
+  const detectorHasSamples = snapshot.detectorLatencySamples >= 8;
+  const ocrHasSamples = snapshot.ocrLatencySamples >= 4;
+
+  if (
+    detectorHasSamples &&
+    snapshot.detectorLatencyP95Ms > Math.max(SCANNER_PERFORMANCE_TARGETS.detectorP95LatencyMs, detectorTargetMs * 2.2)
+  ) {
+    return `Detector P95 ${snapshot.detectorLatencyP95Ms.toFixed(0)} ms exceeded Tier ${snapshot.deviceTier} target`;
+  }
+
+  if (detectorHasSamples && recentDetectorAvg > detectorTargetMs * 1.8) {
+    return `Detector average ${recentDetectorAvg.toFixed(0)} ms is too slow`;
+  }
+
+  if (
+    snapshot.detectorLatencySamples >= 30 &&
+    previousDetectorAvg > 0 &&
+    recentDetectorAvg > previousDetectorAvg * 1.35 &&
+    recentDetectorAvg > detectorTargetMs * 1.25
+  ) {
+    return 'Thermal slowdown trend detected';
+  }
+
+  if (ocrHasSamples && snapshot.ocrLatencyP95Ms > Math.max(SCANNER_PERFORMANCE_TARGETS.ocrP95LatencyMs, 900)) {
+    return `OCR P95 ${snapshot.ocrLatencyP95Ms.toFixed(0)} ms is too slow`;
+  }
+
+  if (ocrHasSamples && recentOcrAvg > 700 && snapshot.lastOcrQueueDepth >= 3) {
+    return 'OCR queue is backing up';
+  }
+
+  if (cameraFps > 0 && cameraFps < 8 && detectorFps < Math.max(2, SCANNER_PERFORMANCE_TARGETS.sustainedDetectorFps * 0.5)) {
+    return 'Camera frame rate dropped under load';
+  }
+
+  return null;
+}
+
+function canRecoverRuntimeProfile(
+  snapshot: ScannerMetricsSnapshot,
+  detectorFps: number,
+  cameraFps: number
+): boolean {
+  const detectorTargetMs = getTierDetectorTargetMs(snapshot.deviceTier);
+  const recentDetectorAvg = getSampleAverage(snapshot.detectorLatencyHistoryMs, 16);
+  const recentOcrAvg = getSampleAverage(snapshot.ocrLatencyHistoryMs, 8);
+  const detectorHealthy =
+    snapshot.detectorLatencySamples < 8 ||
+    (recentDetectorAvg > 0 && recentDetectorAvg < detectorTargetMs * 1.15 && snapshot.detectorLatencyP95Ms < detectorTargetMs * 1.7);
+  const ocrHealthy = snapshot.ocrLatencySamples < 4 || recentOcrAvg < 450 || snapshot.lastOcrQueueDepth <= 1;
+  const cameraHealthy = cameraFps === 0 || cameraFps >= 10;
+
+  return detectorHealthy && ocrHealthy && cameraHealthy && detectorFps >= 2 && snapshot.lastOcrQueueDepth <= 2;
+}
+
 function classifyDeviceTier(
   benchmark: AdmissionBenchmarkResult | null,
   runtimeState: ANPRRuntimeState
 ): DeviceTier {
+  const android = isAndroidDevice();
+  const constrainedAndroid = isConstrainedAndroidDevice();
+
   if (benchmark) {
+    if (android) {
+      if (!constrainedAndroid && benchmark.estimatedFps >= 8) return 'B';
+      if (benchmark.estimatedFps >= 3.2) return 'C';
+      return 'D';
+    }
+
     if (benchmark.estimatedFps >= 9) return 'A';
     if (benchmark.estimatedFps >= 6.5) return 'B';
     if (benchmark.estimatedFps >= 4) return 'C';
     return 'D';
   }
 
+  if (android) return constrainedAndroid ? 'D' : 'C';
   if (runtimeState === 'READY_WEBGPU') return 'A';
   if (runtimeState === 'READY_WASM') return 'B';
   if (runtimeState === 'DEGRADED_PERFORMANCE') return 'C';
@@ -427,14 +599,147 @@ function getTierDetectorTargetMs(tier: DeviceTier): number {
     case 'A':
       return 90;
     case 'B':
-      return 140;
+      return 160;
     case 'C':
-      return 200;
+      return 280;
     case 'D':
-      return 320;
+      return 480;
     default:
       return DETECTION_TARGET_INTERVAL_MS;
   }
+}
+
+function getTierDetectorBusyIntervalMs(tier: DeviceTier): number {
+  switch (tier) {
+    case 'A':
+      return DETECTION_BUSY_INTERVAL_MS;
+    case 'B':
+      return 240;
+    case 'C':
+      return 420;
+    case 'D':
+      return 700;
+    default:
+      return DETECTION_BUSY_INTERVAL_MS;
+  }
+}
+
+function getTierOcrConcurrencyLimit(tier: DeviceTier): number {
+  switch (tier) {
+    case 'A':
+      return 3;
+    case 'B':
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function isAndroidDevice(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return /Android/i.test(navigator.userAgent || '');
+}
+
+function isConstrainedAndroidDevice(): boolean {
+  if (!isAndroidDevice() || typeof navigator === 'undefined') return false;
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const memoryGb = nav.deviceMemory ?? 4;
+  const cpuCores = navigator.hardwareConcurrency || 4;
+  const userAgent = navigator.userAgent || '';
+
+  return memoryGb <= 4 || cpuCores <= 4 || /wv|Version\/4\.0/i.test(userAgent);
+}
+
+function isInAppBrowser(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const userAgent = navigator.userAgent || '';
+
+  return /FBAN|FBAV|Instagram|Line|MicroMessenger|WhatsApp|Twitter|TikTok|Snapchat|; wv\)|\bwv\b/i.test(userAgent);
+}
+
+function getCameraPerformanceConstraints(adaptationLevel = 0): MediaTrackConstraints {
+  const { width, height, fps } = getCameraProfileValues(adaptationLevel);
+  const androidOrAdapted = isAndroidDevice() || adaptationLevel > 0;
+
+  if (androidOrAdapted) {
+    return {
+      width: { ideal: width, max: Math.min(960, Math.round(width * 1.2)) },
+      height: { ideal: height, max: Math.min(720, Math.round(height * 1.2)) },
+      frameRate: { ideal: fps, max: Math.min(20, fps + 3) },
+    };
+  }
+
+  return {
+    width: { ideal: 1280 },
+    height: { ideal: 720 },
+    frameRate: { ideal: 30 },
+  };
+}
+
+function getCameraVideoConstraints(slot: CameraSlot, adaptationLevel = 0): MediaTrackConstraints {
+  const baseConstraints = getCameraPerformanceConstraints(adaptationLevel);
+
+  if (slot.deviceId) {
+    return {
+      ...baseConstraints,
+      deviceId: { exact: slot.deviceId },
+    };
+  }
+
+  return {
+    ...baseConstraints,
+    facingMode: { ideal: 'environment' },
+  };
+}
+
+function getProcessingMaxLongEdge(tier: DeviceTier, adaptationLevel = 0): number {
+  if (adaptationLevel >= 3) return 360;
+  if (adaptationLevel >= 2) return 420;
+  if (adaptationLevel >= 1) return 560;
+  if (isAndroidDevice()) {
+    if (tier === 'D') return 480;
+    if (tier === 'C') return 640;
+    return 720;
+  }
+
+  return 1280;
+}
+
+function getProcessingDimensions(
+  videoWidth: number,
+  videoHeight: number,
+  tier: DeviceTier,
+  adaptationLevel = 0
+): { width: number; height: number } {
+  if (videoWidth <= 0 || videoHeight <= 0) return { width: 0, height: 0 };
+
+  const maxLongEdge = getProcessingMaxLongEdge(tier, adaptationLevel);
+  const longEdge = Math.max(videoWidth, videoHeight);
+  const scale = Math.min(1, maxLongEdge / longEdge);
+
+  return {
+    width: Math.max(1, Math.round(videoWidth * scale)),
+    height: Math.max(1, Math.round(videoHeight * scale)),
+  };
+}
+
+function getTierCropSampleIntervalMs(baseIntervalMs: number, tier: DeviceTier): number {
+  switch (tier) {
+    case 'A':
+      return baseIntervalMs;
+    case 'B':
+      return Math.round(baseIntervalMs * 1.35);
+    case 'C':
+      return Math.round(baseIntervalMs * 1.9);
+    case 'D':
+      return Math.round(baseIntervalMs * 2.8);
+    default:
+      return baseIntervalMs;
+  }
+}
+
+function yieldToBrowser(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
 function downloadJson(filename: string, payload: unknown): void {
@@ -468,14 +773,16 @@ const CROP_SAMPLE_FAST_MS = 90;
 const CROP_SAMPLE_NORMAL_MS = 160;
 const OCR_FIRST_READ_RETRY_MS = 80;
 const OCR_REPEAT_READ_RETRY_MS = 180;
-const OCR_MIN_TRACK_FRAMES = 3;
-const OCR_MIN_BUFFERED_CROPS = 2;
-const OCR_MIN_TRACK_CONFIDENCE = 0.75;
-const OCR_DEFAULT_MIN_READABLE_WIDTH = 80;
+const OCR_MIN_TRACK_FRAMES = 2;
+const OCR_MIN_BUFFERED_CROPS = 1;
+const OCR_FIRST_READ_MIN_TRACK_CONFIDENCE = 0.62;
+const OCR_MIN_TRACK_CONFIDENCE = 0.70;
+const OCR_DEFAULT_MIN_READABLE_WIDTH = 48;
 const OCR_MAX_BEST_CROP_AGE_MS = 1800;
-const OCR_FIRST_READ_MIN_QUALITY = 0.34;
-const OCR_REPEAT_READ_MIN_QUALITY = 0.28;
+const OCR_FIRST_READ_MIN_QUALITY = 0.24;
+const OCR_REPEAT_READ_MIN_QUALITY = 0.20;
 const OCR_MAX_CONCURRENCY = 4;
+const OCR_NO_MATCH_COMMIT_MIN_CONFIDENCE = 0.50;
 const MOTION_NORMAL_MAX = 0.15;
 const MOTION_UNSTABLE_MAX = 0.30;
 const MOTION_COLLECT_ONLY_MAX = 0.50;
@@ -483,6 +790,10 @@ const OVERLAY_ANGLE_SAMPLE_MS = 140;
 const MAX_OVERLAY_TILT_RAD = 0.35;
 const SCANNER_MAINTENANCE_INTERVAL_MS = 1000;
 const COOLDOWN_MAP_MAX_ENTRIES = 120;
+const PERFORMANCE_ADAPTATION_CHECK_MS = 5000;
+const PERFORMANCE_ADAPTATION_COOLDOWN_MS = 12000;
+const PERFORMANCE_RECOVERY_COOLDOWN_MS = 45000;
+const CAMERA_CONSTRAINT_APPLY_COOLDOWN_MS = 10000;
 
 type MotionOcrMode = MotionBucket;
 type OcrQueuePressure = 'EMPTY' | 'MODERATE' | 'LARGE' | 'CRITICAL';
@@ -589,6 +900,18 @@ function canCommitFinalPlateOutcome(text: string): boolean {
   return true;
 }
 
+function canCommitNoMatchOutcome(text: string, confidence: number, score: number, voteCount: number): boolean {
+  const pattern = validateMalaysianPattern(text);
+  const { letters, digits } = countPlateChars(text);
+  const stableEnough = voteCount >= 2 || Math.max(confidence, score) >= OCR_NO_MATCH_COMMIT_MIN_CONFIDENCE;
+
+  if (!stableEnough) return false;
+  if (text.length < 3 || letters === 0 || digits === 0) return false;
+  if (text.length >= 5 && digits < 2) return false;
+
+  return pattern.isValid || pattern.score >= 0.45;
+}
+
 function getTrackVoteCount(track: ActiveTrack): number {
   return Array.from(track.votes.values()).reduce((sum, vote) => sum + vote.count, 0);
 }
@@ -614,6 +937,9 @@ function getMotionOcrMode(track: ActiveTrack): MotionOcrMode {
 function canAttemptOcrForMotion(track: ActiveTrack, mode: MotionOcrMode): boolean {
   if (mode === 'NORMAL') return true;
   if (mode === 'UNSTABLE') return track.framesSeen % 2 === 0;
+  if (mode === 'COLLECT_ONLY') {
+    return getTrackVoteCount(track) === 0 && track.framesSeen >= OCR_MIN_TRACK_FRAMES + 2 && track.framesSeen % 4 === 0;
+  }
   return false;
 }
 
@@ -637,12 +963,21 @@ function shouldSkipTrackForOcrPressure(
   qualityScore: number
 ): boolean {
   if (pressure === 'EMPTY') return false;
-  if (pressure === 'MODERATE') return track.framesSeen % 2 !== 0;
-  if (pressure === 'LARGE') {
-    return priorityIndex >= maxConcurrency || (track.trackConfidence ?? 0) < 0.85 || qualityScore < 0.50;
+  const voteCount = getTrackVoteCount(track);
+  const timeSinceAttempt = track.lastOcrAttemptAt ? Date.now() - track.lastOcrAttemptAt : Number.POSITIVE_INFINITY;
+  const needsFirstRead = voteCount === 0;
+  const starving = timeSinceAttempt > 1400;
+
+  if (needsFirstRead && qualityScore >= 0.30 && (track.trackConfidence ?? 0) >= OCR_FIRST_READ_MIN_TRACK_CONFIDENCE) {
+    return false;
   }
 
-  return priorityIndex > 0 || (track.trackConfidence ?? 0) < 0.92 || qualityScore < 0.60;
+  if (pressure === 'MODERATE') return !starving && track.framesSeen % 2 !== 0;
+  if (pressure === 'LARGE') {
+    return priorityIndex >= maxConcurrency * 2 || (track.trackConfidence ?? 0) < 0.78 || qualityScore < 0.36;
+  }
+
+  return priorityIndex >= Math.max(1, maxConcurrency) || (track.trackConfidence ?? 0) < 0.86 || qualityScore < 0.48;
 }
 
 function pruneCooldownMap(cooldowns: Map<string, number>, cooldownMs: number, now: number): void {
@@ -837,6 +1172,8 @@ export default function ScannerPage() {
   const runtimeMetricsRef = useRef<ScannerRuntimeMetrics>(createInitialRuntimeMetrics());
   const completedTrackEventsRef = useRef<CompletedTrackEvent[]>([]);
   const lostTrackIdsRef = useRef<Set<string>>(new Set());
+  const lastPerformanceAdaptationAtRef = useRef(0);
+  const lastCameraConstraintApplyAtRef = useRef(0);
   const stopCameraRef = useRef<(options?: { preserveScanningState?: boolean }) => void>(() => undefined);
   const startVisibleCamerasRef = useRef<(options?: { resumeScanning?: boolean }) => Promise<boolean>>(async () => false);
 
@@ -898,6 +1235,66 @@ export default function ScannerPage() {
     return slotMetricsRef.current[slotId];
   }, []);
 
+  const applyActiveCameraConstraints = useCallback(async () => {
+    const now = Date.now();
+    if (now - lastCameraConstraintApplyAtRef.current < CAMERA_CONSTRAINT_APPLY_COOLDOWN_MS) return;
+    lastCameraConstraintApplyAtRef.current = now;
+
+    const metrics = runtimeMetricsRef.current;
+    const constraints = getCameraPerformanceConstraints(metrics.adaptationLevel);
+    const tracks = Object.values(activeStreamsRef.current).flatMap((stream) => stream.getVideoTracks());
+
+    await Promise.all(
+      tracks.map(async (track) => {
+        if (typeof track.applyConstraints !== 'function') return;
+        try {
+          await track.applyConstraints(constraints);
+        } catch {
+          // Some Android browsers accept getUserMedia constraints but reject live renegotiation.
+        }
+      })
+    );
+
+    metrics.cameraProfile = getCameraProfileLabel(metrics.deviceTier, metrics.adaptationLevel);
+  }, []);
+
+  const maybeAdaptRuntimePerformance = useCallback(
+    (snapshot: ScannerMetricsSnapshot, detectorFps: number, cameraFps: number) => {
+      const now = Date.now();
+      if (now - lastPerformanceAdaptationAtRef.current < PERFORMANCE_ADAPTATION_CHECK_MS) return;
+
+      const metrics = runtimeMetricsRef.current;
+      const baseTier = classifyDeviceTier(getLatestBenchmarkResult(), runtimeStateRef.current);
+      const reason = getRuntimeAdaptationReason(snapshot, detectorFps, cameraFps);
+
+      if (
+        reason &&
+        metrics.adaptationLevel < 3 &&
+        now - lastPerformanceAdaptationAtRef.current >= PERFORMANCE_ADAPTATION_COOLDOWN_MS
+      ) {
+        applyRuntimePerformanceProfile(metrics, baseTier, metrics.adaptationLevel + 1, reason);
+        lastPerformanceAdaptationAtRef.current = now;
+        void applyActiveCameraConstraints();
+        return;
+      }
+
+      if (
+        !reason &&
+        metrics.adaptationLevel > 0 &&
+        now - lastPerformanceAdaptationAtRef.current >= PERFORMANCE_RECOVERY_COOLDOWN_MS &&
+        canRecoverRuntimeProfile(snapshot, detectorFps, cameraFps)
+      ) {
+        applyRuntimePerformanceProfile(metrics, baseTier, metrics.adaptationLevel - 1, 'Recovered sustained performance');
+        lastPerformanceAdaptationAtRef.current = now;
+        void applyActiveCameraConstraints();
+        return;
+      }
+
+      applyRuntimePerformanceProfile(metrics, baseTier, metrics.adaptationLevel, metrics.performanceModeReason);
+    },
+    [applyActiveCameraConstraints]
+  );
+
   const flushScannerMetrics = useCallback(() => {
     const metrics = Object.values(slotMetricsRef.current);
     const aggregate = metrics.reduce(
@@ -919,14 +1316,16 @@ export default function ScannerPage() {
     setTracksList(aggregate.tracks);
     runtimeMetricsRef.current.memoryCurrentMb = getUsedHeapMb() ?? runtimeMetricsRef.current.memoryCurrentMb;
     const snapshot = createMetricsSnapshot(runtimeMetricsRef.current, aggregate.tracks);
-    setRuntimeMetricsSnapshot(snapshot);
-    setSystemHealthSnapshot(createSystemHealthSnapshot(snapshot, aggregate.detFrames, aggregate.camFrames));
+    maybeAdaptRuntimePerformance(snapshot, aggregate.detFrames, aggregate.camFrames);
+    const adaptedSnapshot = createMetricsSnapshot(runtimeMetricsRef.current, aggregate.tracks);
+    setRuntimeMetricsSnapshot(adaptedSnapshot);
+    setSystemHealthSnapshot(createSystemHealthSnapshot(adaptedSnapshot, aggregate.detFrames, aggregate.camFrames));
 
     Object.values(slotMetricsRef.current).forEach((item) => {
       item.camFrames = 0;
       item.detFrames = 0;
     });
-  }, []);
+  }, [maybeAdaptRuntimePerformance]);
 
   const resetLiveScanUi = useCallback(() => {
     Object.values(slotRuntimesRef.current).forEach((runtime) => {
@@ -941,6 +1340,8 @@ export default function ScannerPage() {
     runtimeMetricsRef.current = createInitialRuntimeMetrics(
       classifyDeviceTier(getLatestBenchmarkResult(), runtimeStateRef.current)
     );
+    lastPerformanceAdaptationAtRef.current = Date.now();
+    lastCameraConstraintApplyAtRef.current = 0;
     completedTrackEventsRef.current = [];
     lostTrackIdsRef.current.clear();
     const emptySnapshot = createMetricsSnapshot(runtimeMetricsRef.current, []);
@@ -966,7 +1367,12 @@ export default function ScannerPage() {
     setRuntimeErrorMessage(getRuntimeErrorMessage());
     setDetectorProvider(getActiveDetectorProvider());
     setOcrProvider(getActivePpOcrProvider());
-    runtimeMetricsRef.current.deviceTier = classifyDeviceTier(latestBenchmark, nextState);
+    applyRuntimePerformanceProfile(
+      runtimeMetricsRef.current,
+      classifyDeviceTier(latestBenchmark, nextState),
+      runtimeMetricsRef.current.adaptationLevel,
+      runtimeMetricsRef.current.performanceModeReason
+    );
   }, []);
 
   const startRuntimeInit = useCallback(async () => {
@@ -1019,6 +1425,7 @@ export default function ScannerPage() {
       const nextSupportsMultiCamera = canRunMultiCameraOnCurrentDevice();
       supportsMultiCameraScanRef.current = nextSupportsMultiCamera;
       setSupportsMultiCameraScan(nextSupportsMultiCamera);
+      void applyActiveCameraConstraints();
 
       if (!nextSupportsMultiCamera) {
         setCameraSlots((slots) => {
@@ -1038,7 +1445,7 @@ export default function ScannerPage() {
       window.removeEventListener('resize', updateCapability);
       window.removeEventListener('orientationchange', updateCapability);
     };
-  }, []);
+  }, [applyActiveCameraConstraints]);
 
   useEffect(() => {
     addHistoryLogRef.current = addHistoryLog;
@@ -1065,6 +1472,7 @@ export default function ScannerPage() {
         0.7
       ),
       debugMode: false,
+      showCenterGuide: false,
     };
   }, [settings, soundEnabled]);
 
@@ -1173,9 +1581,7 @@ export default function ScannerPage() {
 
       if (!stream) {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: slot.deviceId
-            ? { deviceId: { exact: slot.deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
-            : { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+          video: getCameraVideoConstraints(slot, runtimeMetricsRef.current.adaptationLevel),
           audio: false,
         });
         activeStreamsRef.current[streamKey] = stream;
@@ -1537,7 +1943,7 @@ export default function ScannerPage() {
       let detectionTimeout: ReturnType<typeof setTimeout> | undefined;
       let lastVideoTime = -1;
       let lastDetectorValidationAt = 0;
-      let adaptiveDetectorIntervalMs = DETECTION_TARGET_INTERVAL_MS;
+      let adaptiveDetectorIntervalMs = getTierDetectorTargetMs(runtimeMetricsRef.current.deviceTier);
 
       const scheduleDetection = (delay = 100) => {
         if (stopped) return;
@@ -1569,9 +1975,15 @@ export default function ScannerPage() {
         }
 
         const processingCanvas = runtime.processingCanvas;
-        if (processingCanvas.width !== video.videoWidth || processingCanvas.height !== video.videoHeight) {
-          processingCanvas.width = video.videoWidth;
-          processingCanvas.height = video.videoHeight;
+        const processingDimensions = getProcessingDimensions(
+          video.videoWidth,
+          video.videoHeight,
+          runtimeMetricsRef.current.deviceTier,
+          runtimeMetricsRef.current.adaptationLevel
+        );
+        if (processingCanvas.width !== processingDimensions.width || processingCanvas.height !== processingDimensions.height) {
+          processingCanvas.width = processingDimensions.width;
+          processingCanvas.height = processingDimensions.height;
         }
 
         const processingCtx = processingCanvas.getContext('2d', { willReadFrequently: true });
@@ -1582,6 +1994,9 @@ export default function ScannerPage() {
 
         const detectionStartedAt = performance.now();
         processingCtx.drawImage(video, 0, 0, processingCanvas.width, processingCanvas.height);
+        if (isAndroidDevice()) {
+          await yieldToBrowser();
+        }
 
         const scannerSettings = settingsRef.current;
         let detectedPlates: Awaited<ReturnType<typeof detectMalaysianPlates>> = [];
@@ -1661,7 +2076,10 @@ export default function ScannerPage() {
         confirmedTracks.forEach((track) => {
           if (!isTrackAvailableForReading(track)) return;
 
-          if (!track.lastOverlayAngleAt || cropSampleNow - track.lastOverlayAngleAt >= OVERLAY_ANGLE_SAMPLE_MS) {
+          if (
+            !isAndroidDevice() &&
+            (!track.lastOverlayAngleAt || cropSampleNow - track.lastOverlayAngleAt >= OVERLAY_ANGLE_SAMPLE_MS)
+          ) {
             track.overlayAngle = estimatePlateOverlayAngle(processingCanvas, track.bbox, track.overlayAngle ?? 0);
             track.lastOverlayAngleAt = cropSampleNow;
           }
@@ -1676,7 +2094,10 @@ export default function ScannerPage() {
           }
 
           const existingCrop = runtime.bestFrameSelector.getBestCrop(track.trackNumber);
-          const sampleInterval = track.bbox.confidence >= 0.7 ? CROP_SAMPLE_FAST_MS : CROP_SAMPLE_NORMAL_MS;
+          const sampleInterval = getTierCropSampleIntervalMs(
+            track.bbox.confidence >= 0.7 ? CROP_SAMPLE_FAST_MS : CROP_SAMPLE_NORMAL_MS,
+            runtimeMetricsRef.current.deviceTier
+          );
           if (existingCrop && track.lastCropSampledAt && cropSampleNow - track.lastCropSampledAt < sampleInterval) {
             return;
           }
@@ -1705,7 +2126,7 @@ export default function ScannerPage() {
         );
         const targetInterval =
           activeOcrCount.current > 0
-            ? Math.max(adaptiveDetectorIntervalMs, DETECTION_BUSY_INTERVAL_MS)
+            ? Math.max(adaptiveDetectorIntervalMs, getTierDetectorBusyIntervalMs(runtimeMetricsRef.current.deviceTier))
             : adaptiveDetectorIntervalMs;
         const nextDelay = Math.max(
           DETECTION_MIN_DELAY_MS,
@@ -1733,6 +2154,7 @@ export default function ScannerPage() {
 
         const maxOcrConcurrency = Math.min(
           OCR_MAX_CONCURRENCY,
+          getTierOcrConcurrencyLimit(runtimeMetricsRef.current.deviceTier),
           Math.max(1, scannerSettings.maxOcrConcurrency || INITIAL_SETTINGS.maxOcrConcurrency)
         );
         const priorityIds = prioritiseTracks(
@@ -1747,7 +2169,24 @@ export default function ScannerPage() {
           canvas.width,
           canvas.height,
           Math.max(maxOcrConcurrency, confirmedTracks.length)
-        );
+        ).sort((leftId, rightId) => {
+          const leftTrack = slotRuntime.tracker.getTrack(leftId);
+          const rightTrack = slotRuntime.tracker.getTrack(rightId);
+          if (!leftTrack || !rightTrack) return 0;
+
+          const leftVotes = getTrackVoteCount(leftTrack);
+          const rightVotes = getTrackVoteCount(rightTrack);
+          if (leftVotes === 0 && rightVotes > 0) return -1;
+          if (rightVotes === 0 && leftVotes > 0) return 1;
+
+          const leftLastAttempt = leftTrack.lastOcrAttemptAt ?? 0;
+          const rightLastAttempt = rightTrack.lastOcrAttemptAt ?? 0;
+          if (Math.abs(leftLastAttempt - rightLastAttempt) > 500) {
+            return leftLastAttempt - rightLastAttempt;
+          }
+
+          return 0;
+        });
         const ocrQueuePressure = getOcrQueuePressure(
           priorityIds.length,
           activeOcrCount.current,
@@ -1782,7 +2221,9 @@ export default function ScannerPage() {
             continue;
           }
 
-          if ((track.trackConfidence ?? 0) < OCR_MIN_TRACK_CONFIDENCE) {
+          const minTrackConfidence =
+            voteCount === 0 ? OCR_FIRST_READ_MIN_TRACK_CONFIDENCE : OCR_MIN_TRACK_CONFIDENCE;
+          if ((track.trackConfidence ?? 0) < minTrackConfidence) {
             track.ocrState = 'COLLECTING';
             track.pipelineState = 'TRACKING';
             continue;
@@ -1795,7 +2236,7 @@ export default function ScannerPage() {
           const bufferedCropCount = slotRuntime.bestFrameSelector.getCropCount(track.trackNumber);
           const requiredCropCount = voteCount === 0 ? OCR_MIN_BUFFERED_CROPS : 1;
           const hasEnoughBufferedCrops = bufferedCropCount >= requiredCropCount;
-          const canReadFirstFrame = track.framesSeen >= OCR_MIN_TRACK_FRAMES || track.bbox.confidence >= 0.78;
+          const canReadFirstFrame = track.framesSeen >= OCR_MIN_TRACK_FRAMES || track.bbox.confidence >= 0.68;
 
           if (
             !canReadFirstFrame ||
@@ -1864,25 +2305,34 @@ export default function ScannerPage() {
             try {
               if (!targetCropFromBest) rememberTransientCanvas(targetCrop);
 
-              const innerTextCrop = createInnerPlateTextCrop(targetCrop);
-              rememberTransientCanvas(innerTextCrop);
-
-              const innerCrops = generateAdaptiveCrops(
-                innerTextCrop,
-                { x: 0, y: 0, width: innerTextCrop.width, height: innerTextCrop.height, confidence: 1 },
-                360,
-                108,
-                ['ORIGINAL', 'INVERTED']
-              );
+              const activeTrackLoad = Math.max(1, confirmedTracks.length);
+              const fastOcrPass = runtimeMetricsRef.current.deviceTier !== 'A' || activeTrackLoad >= 2;
+              const ultraFastOcrPass = runtimeMetricsRef.current.deviceTier === 'D' || isConstrainedAndroidDevice();
+              const innerCrops = ultraFastOcrPass
+                ? []
+                : (() => {
+                    const innerTextCrop = createInnerPlateTextCrop(targetCrop);
+                    rememberTransientCanvas(innerTextCrop);
+                    return generateAdaptiveCrops(
+                      innerTextCrop,
+                      { x: 0, y: 0, width: innerTextCrop.width, height: innerTextCrop.height, confidence: 1 },
+                      360,
+                      108,
+                      fastOcrPass ? ['ORIGINAL'] : ['ORIGINAL', 'INVERTED']
+                    );
+                  })();
               innerCrops.forEach((crop) => {
                 rememberTransientCanvas(crop.canvas);
                 rememberTransientCanvas(crop.topLineCanvas);
                 rememberTransientCanvas(crop.bottomLineCanvas);
               });
 
-              const activeTrackLoad = Math.max(1, confirmedTracks.length);
               const fullCropVariants =
-                activeTrackLoad >= 3
+                ultraFastOcrPass
+                  ? (['ORIGINAL'] as const)
+                  : fastOcrPass
+                  ? (['ORIGINAL', 'DARK_BG'] as const)
+                  : activeTrackLoad >= 3
                   ? (['ORIGINAL', 'DARK_BG', 'INVERTED'] as const)
                   : (['ORIGINAL', 'SHARPEN', 'DARK_BG', 'INVERTED'] as const);
               const adaptiveCrops = generateAdaptiveCrops(
@@ -1898,8 +2348,11 @@ export default function ScannerPage() {
                 rememberTransientCanvas(crop.bottomLineCanvas);
               });
 
-              const maxCandidateCrops = activeTrackLoad >= 3 ? 4 : 6;
-              const candidateCrops = [...innerCrops, ...adaptiveCrops].slice(0, maxCandidateCrops);
+              const maxCandidateCrops = ultraFastOcrPass ? 1 : fastOcrPass ? 3 : activeTrackLoad >= 3 ? 4 : 6;
+              const candidateCrops = (fastOcrPass ? [...adaptiveCrops, ...innerCrops] : [...innerCrops, ...adaptiveCrops]).slice(
+                0,
+                maxCandidateCrops
+              );
               const fallbackCrop = {
                 canvas: targetCrop,
                 isTwoLine: targetCrop.width / Math.max(1, targetCrop.height) < 2.3,
@@ -1912,6 +2365,9 @@ export default function ScannerPage() {
               let bestPatternValid = false;
 
               for (const crop of candidateCrops.length > 0 ? candidateCrops : [fallbackCrop]) {
+                if (isAndroidDevice()) {
+                  await yieldToBrowser();
+                }
                 const result = await recognizePlateFromCanvas(crop.canvas, crop.isTwoLine);
                 const resultText = result.normalizedPlate || result.text;
                 const pattern = validateMalaysianPattern(resultText);
@@ -1951,14 +2407,19 @@ export default function ScannerPage() {
                 const canFastMatch = bestPatternValid && digits >= (text.length >= 5 ? 2 : 1);
                 const veryStrongRead =
                   canFastMatch && conf >= Math.max(0.6, scannerSettings.recognitionThreshold) && bestScore >= 0.7;
+                const mobileStrongSingleRead = fastOcrPass && canFastMatch && conf >= 0.32 && bestScore >= 0.62;
                 const strongRead = canFastMatch && conf >= 0.32 && bestScore >= 0.56;
                 const requiredVotes = veryStrongRead
                   ? 1
+                  : mobileStrongSingleRead
+                    ? 1
                   : strongRead
                     ? Math.min(2, scannerSettings.consensusVotes)
                     : scannerSettings.consensusVotes;
                 const confidenceGate = veryStrongRead
                   ? Math.min(scannerSettings.recognitionThreshold, 0.58)
+                  : mobileStrongSingleRead
+                    ? Math.min(scannerSettings.recognitionThreshold, 0.52)
                   : strongRead
                     ? Math.min(scannerSettings.recognitionThreshold, 0.45)
                     : scannerSettings.recognitionThreshold;
@@ -1971,8 +2432,14 @@ export default function ScannerPage() {
                   updatedTrack.stabilizedPlate = consensus.normalizedPlate;
                   updatedTrack.stabilizedConfidence = matchConfidence;
                   const finalOutcomeReady = canCommitFinalPlateOutcome(consensus.normalizedPlate);
+                  const noMatchOutcomeReady = canCommitNoMatchOutcome(
+                    consensus.normalizedPlate,
+                    matchConfidence,
+                    bestScore,
+                    consensus.voteCount
+                  );
                   await runDatabaseMatch(updatedTrack, consensus.normalizedPlate, matchConfidence, sourceSlotId, {
-                    commitNoCase: finalOutcomeReady,
+                    commitNoCase: finalOutcomeReady || noMatchOutcomeReady,
                   });
                 }
               } else if (updatedTrack.votes.size === 0) {
@@ -2013,9 +2480,17 @@ export default function ScannerPage() {
         const overlayCanvas = canvasRefs.current[slotId];
 
         if (video && overlayCanvas && video.readyState >= 2 && video.videoWidth > 0) {
-          if (overlayCanvas.width !== video.videoWidth || overlayCanvas.height !== video.videoHeight) {
-            overlayCanvas.width = video.videoWidth;
-            overlayCanvas.height = video.videoHeight;
+          const overlayDimensions = runtime.processingCanvas?.width
+            ? { width: runtime.processingCanvas.width, height: runtime.processingCanvas.height }
+            : getProcessingDimensions(
+                video.videoWidth,
+                video.videoHeight,
+                runtimeMetricsRef.current.deviceTier,
+                runtimeMetricsRef.current.adaptationLevel
+              );
+          if (overlayCanvas.width !== overlayDimensions.width || overlayCanvas.height !== overlayDimensions.height) {
+            overlayCanvas.width = overlayDimensions.width;
+            overlayCanvas.height = overlayDimensions.height;
           }
 
           const overlayCtx = overlayCanvas.getContext('2d');
@@ -2030,7 +2505,7 @@ export default function ScannerPage() {
               overlayCanvas.width,
               overlayCanvas.height,
               displayTracks,
-              scannerSettings.showCenterGuide
+              false
             );
           }
 
@@ -2099,7 +2574,8 @@ export default function ScannerPage() {
     tracks.forEach((track) => {
       const { x, y, width: boxWidth, height: boxHeight } = track.smoothBbox;
       const color = getTrackColor(track);
-      const label = getTrackPlateText(track) || getTrackStatusLabel(track);
+      const plateText = getTrackPlateText(track);
+      const label = plateText || (track.matchType ? getTrackStatusLabel(track) : '');
       const angle = track.overlayAngle ?? 0;
       const cx = x + boxWidth / 2;
       const cy = y + boxHeight / 2;
@@ -2164,37 +2640,6 @@ export default function ScannerPage() {
     setActiveAlertMatch(null);
   };
 
-  const handleMarkDetectionAction = (detection: SessionDetection) => {
-    if (!detection.vehicleId) return;
-
-    const vehicle = vehicles.find((item) => item.id === detection.vehicleId);
-    if (!vehicle) return;
-
-    const flaggedObj = { ...vehicle, status: 'FLAGGED' as const };
-    updateVehicle(flaggedObj);
-    addHistoryLog({
-      type: 'DETECTION',
-      action: `Tanda Tindakan (Pengimbas): ${vehicle.plate}`,
-      plate: vehicle.plate,
-      details: `Scanner action confirmed by ${role} from ${detection.cameraName}`,
-      note: `Ditanda Tindakan oleh ${role} dari ${detection.cameraName}`,
-      userRole: role,
-      statusMatch: 'EXACT',
-    });
-
-    setLiveDetections((prevStream) => {
-      const nextStream = prevStream.map((item) =>
-        item.id === detection.id ? { ...item, matched: true, matchType: 'EXACT' as const, vehicleId: vehicle.id } : item
-      );
-      localStorage.setItem(RECENT_DETECTIONS_STORAGE_KEY, JSON.stringify(nextStream));
-      return nextStream;
-    });
-
-    if (activeAlertMatch?.vehicle.id === vehicle.id) {
-      setActiveAlertMatch(null);
-    }
-  };
-
   const handleExportScannerMetrics = () => {
     const snapshot = createMetricsSnapshot(runtimeMetricsRef.current, tracksList);
     const health = createSystemHealthSnapshot(snapshot, detFps, camFps);
@@ -2210,6 +2655,21 @@ export default function ScannerPage() {
       performanceTargets: SCANNER_PERFORMANCE_TARGETS,
       health,
       metrics: snapshot,
+      runtimeConfig: {
+        executionMode: snapshot.executionMode,
+        cameraProfile: snapshot.cameraProfile,
+        processingProfile: snapshot.processingProfile,
+        ocrProfile: snapshot.ocrProfile,
+        baseDeviceTier: snapshot.baseDeviceTier,
+        activeDeviceTier: snapshot.deviceTier,
+        adaptationLevel: snapshot.adaptationLevel,
+        performanceMode: snapshot.performanceMode,
+        performanceModeReason: snapshot.performanceModeReason,
+        detectorTargetMs: getTierDetectorTargetMs(snapshot.deviceTier),
+        detectorBusyIntervalMs: getTierDetectorBusyIntervalMs(snapshot.deviceTier),
+        inAppBrowser: isInAppBrowser(),
+        android: isAndroidDevice(),
+      },
       detectorMetrics: {
         medianLatencyMs: snapshot.detectorLatencyMedianMs,
         p95LatencyMs: snapshot.detectorLatencyP95Ms,
@@ -2272,10 +2732,6 @@ export default function ScannerPage() {
   const latestDetection = liveDetections[0] || null;
   const latestExactVehicle =
     latestDetection?.vehicleId ? vehicles.find((vehicle) => vehicle.id === latestDetection.vehicleId) || null : null;
-  const latestPossibleVehicles =
-    latestDetection?.possibleVehicleIds
-      ?.map((vehicleId) => vehicles.find((vehicle) => vehicle.id === vehicleId) || null)
-      .filter((vehicle): vehicle is Vehicle => Boolean(vehicle)) || [];
   const latestSearchHref = latestDetection ? `/search?plate=${encodeURIComponent(latestDetection.plate)}` : '/search';
   const latestResultTone =
     latestDetection?.matchType === 'EXACT' || latestDetection?.matched
@@ -2287,6 +2743,7 @@ export default function ScannerPage() {
       : null;
 
   const showDeveloperOverlay = false;
+  const showInAppBrowserWarning = isAndroidDevice() && isInAppBrowser();
 
   return (
     <div className="space-y-4 max-w-6xl mx-auto px-1 sm:px-0">
@@ -2371,6 +2828,82 @@ export default function ScannerPage() {
             window.location.href = '/search';
           }}
         />
+      )}
+
+      {showInAppBrowserWarning && (
+        <div className="flex items-start gap-2 rounded-xl border border-amber-700 bg-amber-950/35 px-3 py-2 text-[11px] font-bold text-amber-200">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            {language === 'BM'
+              ? 'Pelayar dalam aplikasi boleh menyebabkan kamera dan AI menjadi perlahan. Buka TRACK dalam Chrome atau Samsung Internet untuk imbasan terbaik.'
+              : 'In-app browsers can slow camera and AI processing. Open TRACK in Chrome or Samsung Internet for best scanning performance.'}
+          </span>
+        </div>
+      )}
+
+      {latestDetection && latestResultTone && (
+        <div
+          className={`rounded-xl border px-3 py-2.5 shadow-lg ${
+            latestResultTone === 'EXACT'
+              ? 'border-red-700 bg-red-950/45'
+              : latestResultTone === 'POSSIBLE'
+              ? 'border-amber-700 bg-amber-950/35'
+              : 'border-slate-800 bg-slate-900/90'
+          }`}
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              <div
+                className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${
+                  latestResultTone === 'EXACT'
+                    ? 'bg-red-600 text-white'
+                    : latestResultTone === 'POSSIBLE'
+                    ? 'bg-amber-500 text-slate-950'
+                    : 'bg-slate-950 text-cyan-300'
+                }`}
+              >
+                {latestResultTone === 'EXACT' ? (
+                  <ShieldAlert className="h-4 w-4" />
+                ) : latestResultTone === 'POSSIBLE' ? (
+                  <AlertTriangle className="h-4 w-4" />
+                ) : (
+                  <XCircle className="h-4 w-4" />
+                )}
+              </div>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                  <span className="font-mono text-sm font-black text-cyan-300">{latestDetection.plate}</span>
+                  <span className="text-[10px] font-black uppercase tracking-wider text-slate-300">
+                    {latestResultTone === 'EXACT'
+                      ? language === 'BM'
+                        ? 'Padanan kes'
+                        : 'Match'
+                      : latestResultTone === 'POSSIBLE'
+                      ? language === 'BM'
+                        ? 'Semakan'
+                        : 'Possible'
+                      : language === 'BM'
+                      ? 'Tiada padanan'
+                      : 'No match'}
+                  </span>
+                </div>
+                <div className="truncate text-[10px] text-slate-400">
+                  {latestDetection.confidence}% · {latestDetection.cameraName}
+                  {latestResultTone === 'EXACT' && latestExactVehicle
+                    ? ` · ${latestExactVehicle.brand} ${latestExactVehicle.model}`
+                    : ''}
+                </div>
+              </div>
+            </div>
+
+            <Link
+              href={latestSearchHref}
+              className="shrink-0 rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-[10px] font-black uppercase text-slate-300 hover:border-cyan-800 hover:text-cyan-200"
+            >
+              {language === 'BM' ? 'Semak' : 'View'}
+            </Link>
+          </div>
+        </div>
       )}
 
       <div
@@ -2561,7 +3094,7 @@ export default function ScannerPage() {
             <div>
               <div className="text-[10px] font-black uppercase tracking-wider text-cyan-300">Developer Metrics</div>
               <div className="text-[10px] text-slate-500">
-                Tier {runtimeMetricsSnapshot.deviceTier} · Health {systemHealthSnapshot.overallScore}% · {completedTrackEventsRef.current.length} completed track events
+                Tier {runtimeMetricsSnapshot.deviceTier} · {runtimeMetricsSnapshot.performanceMode.replace('_', ' ')} · Health {systemHealthSnapshot.overallScore}% · {completedTrackEventsRef.current.length} completed track events
               </div>
             </div>
             <button
@@ -2603,6 +3136,10 @@ export default function ScannerPage() {
             {[
               ['Camera FPS', camFps.toFixed(0)],
               ['Detector FPS', detFps.toFixed(0)],
+              ['Execution', runtimeMetricsSnapshot.executionMode],
+              ['Camera', runtimeMetricsSnapshot.cameraProfile],
+              ['Detector target', `${getTierDetectorTargetMs(runtimeMetricsSnapshot.deviceTier)} ms`],
+              ['OCR profile', runtimeMetricsSnapshot.ocrProfile],
               ['Detector P50', `${runtimeMetricsSnapshot.detectorLatencyMedianMs.toFixed(0)} ms`],
               ['Detector P95', `${runtimeMetricsSnapshot.detectorLatencyP95Ms.toFixed(0)} ms`],
               ['OCR P50', `${runtimeMetricsSnapshot.ocrLatencyMedianMs.toFixed(0)} ms`],
@@ -2636,155 +3173,6 @@ export default function ScannerPage() {
                 <div className="mt-0.5 font-mono text-xs font-black text-cyan-200">{count}</div>
               </div>
             ))}
-          </div>
-        </div>
-      )}
-
-      {latestDetection && latestResultTone && (
-        <div
-          className={`rounded-2xl border p-3.5 sm:p-4 shadow-xl ${
-            latestResultTone === 'EXACT'
-              ? 'border-red-700 bg-red-950/35'
-              : latestResultTone === 'POSSIBLE'
-              ? 'border-amber-700 bg-amber-950/25'
-              : 'border-slate-800 bg-slate-900/90'
-          }`}
-        >
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-            <div className="flex items-start gap-3 min-w-0">
-              <div
-                className={`mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border ${
-                  latestResultTone === 'EXACT'
-                    ? 'border-red-500 bg-red-600 text-white'
-                    : latestResultTone === 'POSSIBLE'
-                    ? 'border-amber-500 bg-amber-500 text-slate-950'
-                    : 'border-cyan-900 bg-slate-950 text-cyan-300'
-                }`}
-              >
-                {latestResultTone === 'EXACT' ? (
-                  <ShieldAlert className="h-5 w-5" />
-                ) : latestResultTone === 'POSSIBLE' ? (
-                  <AlertTriangle className="h-5 w-5" />
-                ) : (
-                  <XCircle className="h-5 w-5" />
-                )}
-              </div>
-              <div className="min-w-0">
-                <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">
-                  {language === 'BM' ? 'Keputusan Imbasan Terkini' : 'Latest Scanner Result'}
-                </div>
-                <h2 className="text-sm sm:text-base font-black text-white uppercase tracking-wide">
-                  {latestResultTone === 'EXACT'
-                    ? language === 'BM'
-                      ? 'Padanan kes dijumpai'
-                      : 'Case match found'
-                    : latestResultTone === 'POSSIBLE'
-                    ? language === 'BM'
-                      ? 'Padanan berpotensi'
-                      : 'Possible match'
-                    : language === 'BM'
-                    ? 'Tiada padanan aktif'
-                    : 'No active match'}
-                </h2>
-                <p className="mt-1 text-[11px] sm:text-xs text-slate-400">
-                  {latestResultTone === 'EXACT' && latestExactVehicle
-                    ? `${latestExactVehicle.brand} ${latestExactVehicle.model} - ${latestExactVehicle.financeCompany}`
-                    : latestResultTone === 'POSSIBLE' && latestPossibleVehicles.length > 0
-                    ? `${language === 'BM' ? 'Semak calon:' : 'Review candidates:'} ${latestPossibleVehicles
-                        .map((vehicle) => vehicle.plate)
-                        .join(', ')}`
-                    : language === 'BM'
-                    ? 'Direkod untuk audit sahaja. Tiada amaran tindakan dikeluarkan.'
-                    : 'Logged for audit only. No action alert was raised.'}
-                </p>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 lg:min-w-[520px]">
-              <div className="rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
-                <div className="flex items-center gap-1.5 text-[9px] font-bold uppercase text-slate-500">
-                  <FileSearch className="h-3 w-3 text-cyan-400" />
-                  <span>{language === 'BM' ? 'Plat' : 'Plate'}</span>
-                </div>
-                <div className="mt-1 font-mono text-sm font-black text-cyan-300 truncate">{latestDetection.plate}</div>
-              </div>
-              <div className="rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
-                <div className="flex items-center gap-1.5 text-[9px] font-bold uppercase text-slate-500">
-                  <Activity className="h-3 w-3 text-cyan-400" />
-                  <span>{language === 'BM' ? 'Keyakinan' : 'Confidence'}</span>
-                </div>
-                <div className="mt-1 font-mono text-sm font-black text-slate-200">{latestDetection.confidence}%</div>
-              </div>
-              <div className="rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
-                <div className="flex items-center gap-1.5 text-[9px] font-bold uppercase text-slate-500">
-                  <Video className="h-3 w-3 text-cyan-400" />
-                  <span>{language === 'BM' ? 'Kamera' : 'Camera'}</span>
-                </div>
-                <div className="mt-1 text-xs font-bold text-slate-200 truncate">{latestDetection.cameraName}</div>
-              </div>
-              <div className="rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
-                <div className="flex items-center gap-1.5 text-[9px] font-bold uppercase text-slate-500">
-                  {latestResultTone === 'EXACT' ? (
-                    <DollarSign className="h-3 w-3 text-red-400" />
-                  ) : (
-                    <Car className="h-3 w-3 text-cyan-400" />
-                  )}
-                  <span>{latestResultTone === 'EXACT' ? t('outstandingAmount') : 'Status'}</span>
-                </div>
-                <div className="mt-1 text-xs font-black text-slate-200 truncate">
-                  {latestResultTone === 'EXACT' && latestExactVehicle
-                    ? formatMYR(latestExactVehicle.outstandingAmount)
-                    : latestResultTone === 'POSSIBLE'
-                    ? language === 'BM'
-                      ? 'Semakan'
-                      : 'Review'
-                    : language === 'BM'
-                    ? 'Jelas'
-                    : 'Clear'}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-slate-800/80 pt-3">
-            {latestResultTone === 'EXACT' && latestExactVehicle && (
-              <button
-                type="button"
-                onClick={() => handleMarkDetectionAction(latestDetection)}
-                className="inline-flex items-center justify-center gap-2 rounded-xl border border-red-600 bg-red-600 px-4 py-2 text-xs font-black uppercase text-white shadow-lg shadow-red-950/30 transition-colors hover:bg-red-500"
-              >
-                <BookmarkCheck className="h-4 w-4" />
-                <span>{t('markAction')}</span>
-              </button>
-            )}
-            <Link
-              href={latestSearchHref}
-              className={`inline-flex items-center justify-center gap-2 rounded-xl border px-4 py-2 text-xs font-black uppercase transition-colors ${
-                latestResultTone === 'POSSIBLE'
-                  ? 'border-amber-700 bg-amber-950/70 text-amber-200 hover:bg-amber-900'
-                  : 'border-cyan-800 bg-cyan-950/70 text-cyan-200 hover:bg-cyan-900'
-              }`}
-            >
-              <SearchIcon className="h-4 w-4" />
-              <span>
-                {latestResultTone === 'POSSIBLE'
-                  ? language === 'BM'
-                    ? 'Semak Padanan'
-                    : 'Review Match'
-                  : language === 'BM'
-                  ? 'Carian Manual'
-                  : 'Manual Search'}
-              </span>
-            </Link>
-            {latestResultTone === 'NONE' && (
-              <Link
-                href="/vehicles"
-                className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-xs font-black uppercase text-slate-300 transition-colors hover:border-cyan-800 hover:text-cyan-200"
-              >
-                <Database className="h-4 w-4" />
-                <span>{language === 'BM' ? 'Pangkalan Data' : 'Vehicle DB'}</span>
-              </Link>
-            )}
           </div>
         </div>
       )}

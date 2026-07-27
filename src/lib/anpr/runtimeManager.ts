@@ -129,6 +129,13 @@ function startBackgroundOcrInitAndBenchmark(
         return;
       }
 
+      if (isAndroidBrowser()) {
+        latestBenchmarkResult = null;
+        currentRuntimeState = readyState;
+        runtimeErrorMessage = null;
+        return;
+      }
+
       startBackgroundAdmissionBenchmark(benchmarkConfig, readyState);
     })
     .catch(async () => {
@@ -137,6 +144,11 @@ function startBackgroundOcrInitAndBenchmark(
       currentRuntimeState = 'OCR_UNAVAILABLE';
       runtimeErrorMessage = getPpOcrError() || 'Local PP-OCR ONNX model failed to load.';
     });
+}
+
+function isAndroidBrowser(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return /Android/i.test(navigator.userAgent || '');
 }
 
 function startBackgroundAdmissionBenchmark(
