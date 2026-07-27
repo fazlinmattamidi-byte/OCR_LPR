@@ -15,6 +15,7 @@ import {
   Car,
   CheckCircle2,
   Database,
+  Download,
   DollarSign,
   FileSearch,
   MapPin,
@@ -103,6 +104,353 @@ type SlotMetrics = {
   tracks: ActiveTrack[];
 };
 
+type DeviceTier = 'A' | 'B' | 'C' | 'D';
+
+type MotionBucket = 'NORMAL' | 'UNSTABLE' | 'COLLECT_ONLY' | 'PAUSED';
+
+type ScannerRuntimeMetrics = {
+  sessionStartedAt: number;
+  detectorLatencyTotalMs: number;
+  detectorLatencySamples: number;
+  detectorLatencyHistoryMs: number[];
+  ocrLatencyTotalMs: number;
+  ocrLatencySamples: number;
+  ocrLatencyHistoryMs: number[];
+  trackLifetimeTotalMs: number;
+  completedTrackCount: number;
+  lostTrackObservations: number;
+  reacquiredTrackCount: number;
+  duplicateOcrSkippedCount: number;
+  ocrAttemptCount: number;
+  ocrAcceptedCount: number;
+  ocrSkippedQueuePressureCount: number;
+  consensusAttemptCount: number;
+  falseAlertCount: number;
+  droppedFrameCount: number;
+  cropQualityTotal: number;
+  cropQualitySamples: number;
+  lastOcrQueueDepth: number;
+  maxOcrQueueDepth: number;
+  motionBuckets: Record<MotionBucket, number>;
+  deviceTier: DeviceTier;
+  memoryBaselineMb?: number;
+  memoryCurrentMb?: number;
+};
+
+type ScannerMetricsSnapshot = ScannerRuntimeMetrics & {
+  detectorLatencyAvgMs: number;
+  detectorLatencyMedianMs: number;
+  detectorLatencyP95Ms: number;
+  ocrLatencyAvgMs: number;
+  ocrLatencyMedianMs: number;
+  ocrLatencyP95Ms: number;
+  trackLifetimeAvgMs: number;
+  cropQualityAvg: number;
+  trackLossRate: number;
+  duplicateOcrRate: number;
+  averageTrackConfidence: number;
+  memoryGrowthPercent?: number;
+};
+
+type CompletedTrackEvent = {
+  id: string;
+  trackId: string;
+  plate: string;
+  startedAt: string;
+  endedAt: string;
+  durationMs: number;
+  detectorConfidence: number;
+  detectorLatencyMs: number;
+  trackConfidence: number;
+  confidenceComponents?: ActiveTrack['confidenceComponents'];
+  ocrConfidence: number;
+  ocrLatencyMs: number;
+  consensusCount: number;
+  matchType: 'EXACT' | 'POSSIBLE' | 'NONE';
+  motionLevel: MotionBucket;
+  cropQuality: number;
+  processingTimeMs: number;
+  reasonForCompletion: string;
+  deviceTier: DeviceTier;
+};
+
+type HealthStatus = 'OK' | 'WARN' | 'FAIL' | 'UNKNOWN';
+
+type HealthComponent = {
+  label: string;
+  status: HealthStatus;
+  score: number;
+  detail: string;
+};
+
+type SystemHealthSnapshot = {
+  overallScore: number;
+  components: HealthComponent[];
+};
+
+type ScannerPerformanceTargets = {
+  detectorMedianLatencyMs: number;
+  detectorP95LatencyMs: number;
+  ocrMedianLatencyMs: number;
+  ocrP95LatencyMs: number;
+  trackLossRate: number;
+  duplicateOcrRate: number;
+  falseExactMatches: number;
+  sustainedDetectorFps: number;
+  maxOcrQueueDepth: number;
+  minAverageTrackConfidence: number;
+  memoryGrowthPercent: number;
+};
+
+const SCANNER_PERFORMANCE_TARGETS: ScannerPerformanceTargets = {
+  detectorMedianLatencyMs: 80,
+  detectorP95LatencyMs: 250,
+  ocrMedianLatencyMs: 150,
+  ocrP95LatencyMs: 500,
+  trackLossRate: 0.05,
+  duplicateOcrRate: 0.01,
+  falseExactMatches: 0,
+  sustainedDetectorFps: 5,
+  maxOcrQueueDepth: 6,
+  minAverageTrackConfidence: 0.75,
+  memoryGrowthPercent: 10,
+};
+
+const LATENCY_HISTORY_LIMIT = 300;
+
+function pushBoundedMetricSample(samples: number[], value: number, limit = LATENCY_HISTORY_LIMIT): void {
+  samples.push(Math.round(value));
+  if (samples.length > limit) {
+    samples.splice(0, samples.length - limit);
+  }
+}
+
+function getPercentile(samples: number[], percentile: number): number {
+  if (samples.length === 0) return 0;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((percentile / 100) * sorted.length) - 1));
+  return sorted[idx];
+}
+
+function getUsedHeapMb(): number | undefined {
+  if (typeof performance === 'undefined') return undefined;
+  const maybePerformance = performance as Performance & {
+    memory?: { usedJSHeapSize?: number };
+  };
+  const bytes = maybePerformance.memory?.usedJSHeapSize;
+  return typeof bytes === 'number' ? Math.round((bytes / 1024 / 1024) * 10) / 10 : undefined;
+}
+
+function createInitialRuntimeMetrics(deviceTier: DeviceTier = 'B'): ScannerRuntimeMetrics {
+  const memoryBaselineMb = getUsedHeapMb();
+
+  return {
+    sessionStartedAt: Date.now(),
+    detectorLatencyTotalMs: 0,
+    detectorLatencySamples: 0,
+    detectorLatencyHistoryMs: [],
+    ocrLatencyTotalMs: 0,
+    ocrLatencySamples: 0,
+    ocrLatencyHistoryMs: [],
+    trackLifetimeTotalMs: 0,
+    completedTrackCount: 0,
+    lostTrackObservations: 0,
+    reacquiredTrackCount: 0,
+    duplicateOcrSkippedCount: 0,
+    ocrAttemptCount: 0,
+    ocrAcceptedCount: 0,
+    ocrSkippedQueuePressureCount: 0,
+    consensusAttemptCount: 0,
+    falseAlertCount: 0,
+    droppedFrameCount: 0,
+    cropQualityTotal: 0,
+    cropQualitySamples: 0,
+    lastOcrQueueDepth: 0,
+    maxOcrQueueDepth: 0,
+    motionBuckets: {
+      NORMAL: 0,
+      UNSTABLE: 0,
+      COLLECT_ONLY: 0,
+      PAUSED: 0,
+    },
+    deviceTier,
+    memoryBaselineMb,
+    memoryCurrentMb: memoryBaselineMb,
+  };
+}
+
+function createMetricsSnapshot(
+  metrics: ScannerRuntimeMetrics,
+  tracks: ActiveTrack[]
+): ScannerMetricsSnapshot {
+  const lostAndVisible = metrics.lostTrackObservations + tracks.length;
+  const averageTrackConfidence =
+    tracks.length > 0
+      ? tracks.reduce((sum, track) => sum + (track.trackConfidence ?? 0), 0) / tracks.length
+      : 0;
+  const duplicateOcrRate =
+    metrics.ocrAttemptCount > 0 ? metrics.duplicateOcrSkippedCount / metrics.ocrAttemptCount : 0;
+  const memoryCurrentMb = metrics.memoryCurrentMb ?? getUsedHeapMb();
+  const memoryGrowthPercent =
+    metrics.memoryBaselineMb && memoryCurrentMb
+      ? ((memoryCurrentMb - metrics.memoryBaselineMb) / metrics.memoryBaselineMb) * 100
+      : undefined;
+
+  return {
+    ...metrics,
+    detectorLatencyAvgMs:
+      metrics.detectorLatencySamples > 0 ? metrics.detectorLatencyTotalMs / metrics.detectorLatencySamples : 0,
+    detectorLatencyMedianMs: getPercentile(metrics.detectorLatencyHistoryMs, 50),
+    detectorLatencyP95Ms: getPercentile(metrics.detectorLatencyHistoryMs, 95),
+    ocrLatencyAvgMs: metrics.ocrLatencySamples > 0 ? metrics.ocrLatencyTotalMs / metrics.ocrLatencySamples : 0,
+    ocrLatencyMedianMs: getPercentile(metrics.ocrLatencyHistoryMs, 50),
+    ocrLatencyP95Ms: getPercentile(metrics.ocrLatencyHistoryMs, 95),
+    trackLifetimeAvgMs:
+      metrics.completedTrackCount > 0 ? metrics.trackLifetimeTotalMs / metrics.completedTrackCount : 0,
+    cropQualityAvg:
+      metrics.cropQualitySamples > 0 ? metrics.cropQualityTotal / metrics.cropQualitySamples : 0,
+    trackLossRate:
+      lostAndVisible > 0 ? metrics.lostTrackObservations / lostAndVisible : 0,
+    duplicateOcrRate,
+    averageTrackConfidence,
+    memoryCurrentMb,
+    memoryGrowthPercent,
+  };
+}
+
+function scoreTarget(value: number, target: number, higherIsBetter = false): number {
+  if (target <= 0) return value <= target ? 100 : 0;
+  if (higherIsBetter) {
+    return Math.round(Math.min(1, value / target) * 100);
+  }
+  return Math.round(Math.min(1, target / Math.max(value, 1)) * 100);
+}
+
+function scoreCeilingTarget(value: number, target: number): number {
+  if (value <= target) return 100;
+  if (target <= 0) return 0;
+  return Math.round(Math.max(0, 100 - ((value - target) / target) * 100));
+}
+
+function statusFromScore(score: number): HealthStatus {
+  if (score >= 90) return 'OK';
+  if (score >= 65) return 'WARN';
+  return 'FAIL';
+}
+
+function createHealthComponent(
+  label: string,
+  score: number,
+  detail: string,
+  status?: HealthStatus
+): HealthComponent {
+  return {
+    label,
+    score,
+    detail,
+    status: status ?? statusFromScore(score),
+  };
+}
+
+function createSystemHealthSnapshot(
+  snapshot: ScannerMetricsSnapshot,
+  detectorFps: number,
+  cameraFps: number
+): SystemHealthSnapshot {
+  const targets = SCANNER_PERFORMANCE_TARGETS;
+  const detectorLatencyScore = scoreTarget(snapshot.detectorLatencyP95Ms || snapshot.detectorLatencyAvgMs, targets.detectorP95LatencyMs);
+  const detectorFpsScore = scoreTarget(detectorFps, targets.sustainedDetectorFps, true);
+  const detectorScore = Math.round((detectorLatencyScore * 0.65) + (detectorFpsScore * 0.35));
+
+  const ocrLatencyScore = snapshot.ocrLatencySamples > 0
+    ? scoreTarget(snapshot.ocrLatencyP95Ms || snapshot.ocrLatencyAvgMs, targets.ocrP95LatencyMs)
+    : 100;
+  const duplicateScore = scoreCeilingTarget(snapshot.duplicateOcrRate, targets.duplicateOcrRate);
+  const ocrScore = Math.round(ocrLatencyScore * 0.75 + duplicateScore * 0.25);
+
+  const trackingLossScore = scoreCeilingTarget(snapshot.trackLossRate, targets.trackLossRate);
+  const confidenceScore = scoreTarget(snapshot.averageTrackConfidence, targets.minAverageTrackConfidence, true);
+  const trackingScore = Math.round(trackingLossScore * 0.55 + confidenceScore * 0.45);
+
+  const queueScore = scoreCeilingTarget(snapshot.lastOcrQueueDepth, targets.maxOcrQueueDepth);
+  const cameraScore = cameraFps > 0 ? Math.min(100, Math.round((cameraFps / 24) * 100)) : 0;
+  const falseAlertScore = snapshot.falseAlertCount <= targets.falseExactMatches ? 100 : 0;
+  const memoryScore =
+    typeof snapshot.memoryGrowthPercent === 'number'
+      ? scoreCeilingTarget(snapshot.memoryGrowthPercent, targets.memoryGrowthPercent)
+      : 100;
+
+  const components = [
+    createHealthComponent('Detector', detectorScore, `${detectorFps.toFixed(0)} FPS · P95 ${snapshot.detectorLatencyP95Ms.toFixed(0)} ms`),
+    createHealthComponent('OCR', ocrScore, `P95 ${snapshot.ocrLatencyP95Ms.toFixed(0)} ms · dup ${(snapshot.duplicateOcrRate * 100).toFixed(1)}%`),
+    createHealthComponent('Tracking', trackingScore, `loss ${(snapshot.trackLossRate * 100).toFixed(1)}% · conf ${Math.round(snapshot.averageTrackConfidence * 100)}%`),
+    createHealthComponent('Queue', queueScore, `depth ${snapshot.lastOcrQueueDepth} · max ${snapshot.maxOcrQueueDepth}`),
+    createHealthComponent(
+      'Memory',
+      memoryScore,
+      typeof snapshot.memoryGrowthPercent === 'number'
+        ? `${snapshot.memoryCurrentMb?.toFixed(1) ?? '0.0'} MB · ${snapshot.memoryGrowthPercent.toFixed(1)}%`
+        : 'heap unavailable',
+      typeof snapshot.memoryGrowthPercent === 'number' ? undefined : 'UNKNOWN'
+    ),
+    createHealthComponent('Camera', cameraScore, `${cameraFps.toFixed(0)} FPS`),
+    createHealthComponent('Alerts', falseAlertScore, `${snapshot.falseAlertCount} false exact`, falseAlertScore === 100 ? 'OK' : 'FAIL'),
+  ];
+
+  const knownComponents = components.filter((component) => component.status !== 'UNKNOWN');
+  const overallScore = Math.round(
+    knownComponents.reduce((sum, component) => sum + component.score, 0) / Math.max(1, knownComponents.length)
+  );
+
+  return { overallScore, components };
+}
+
+function classifyDeviceTier(
+  benchmark: AdmissionBenchmarkResult | null,
+  runtimeState: ANPRRuntimeState
+): DeviceTier {
+  if (benchmark) {
+    if (benchmark.estimatedFps >= 9) return 'A';
+    if (benchmark.estimatedFps >= 6.5) return 'B';
+    if (benchmark.estimatedFps >= 4) return 'C';
+    return 'D';
+  }
+
+  if (runtimeState === 'READY_WEBGPU') return 'A';
+  if (runtimeState === 'READY_WASM') return 'B';
+  if (runtimeState === 'DEGRADED_PERFORMANCE') return 'C';
+  return 'D';
+}
+
+function getTierDetectorTargetMs(tier: DeviceTier): number {
+  switch (tier) {
+    case 'A':
+      return 90;
+    case 'B':
+      return 140;
+    case 'C':
+      return 200;
+    case 'D':
+      return 320;
+    default:
+      return DETECTION_TARGET_INTERVAL_MS;
+  }
+}
+
+function downloadJson(filename: string, payload: unknown): void {
+  if (typeof document === 'undefined') return;
+
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
 const SCAN_LOCATIONS: ScanLocation[] = [
   { name: 'Sungai Besi Toll Plaza', gps: '3.0602, 101.7047' },
   { name: 'Jalan Tun Razak, Kuala Lumpur', gps: '3.1618, 101.7165' },
@@ -120,12 +468,24 @@ const CROP_SAMPLE_FAST_MS = 90;
 const CROP_SAMPLE_NORMAL_MS = 160;
 const OCR_FIRST_READ_RETRY_MS = 80;
 const OCR_REPEAT_READ_RETRY_MS = 180;
+const OCR_MIN_TRACK_FRAMES = 3;
+const OCR_MIN_BUFFERED_CROPS = 2;
+const OCR_MIN_TRACK_CONFIDENCE = 0.75;
+const OCR_DEFAULT_MIN_READABLE_WIDTH = 80;
+const OCR_MAX_BEST_CROP_AGE_MS = 1800;
+const OCR_FIRST_READ_MIN_QUALITY = 0.34;
+const OCR_REPEAT_READ_MIN_QUALITY = 0.28;
 const OCR_MAX_CONCURRENCY = 4;
+const MOTION_NORMAL_MAX = 0.15;
+const MOTION_UNSTABLE_MAX = 0.30;
+const MOTION_COLLECT_ONLY_MAX = 0.50;
 const OVERLAY_ANGLE_SAMPLE_MS = 140;
 const MAX_OVERLAY_TILT_RAD = 0.35;
 const SCANNER_MAINTENANCE_INTERVAL_MS = 1000;
 const COOLDOWN_MAP_MAX_ENTRIES = 120;
-const TRACK_RESULT_HOLD_MS = 900;
+
+type MotionOcrMode = MotionBucket;
+type OcrQueuePressure = 'EMPTY' | 'MODERATE' | 'LARGE' | 'CRITICAL';
 
 function getTrackColor(track: ActiveTrack): string {
   if (track.matchType === 'EXACT') return '#ef4444';
@@ -229,6 +589,62 @@ function canCommitFinalPlateOutcome(text: string): boolean {
   return true;
 }
 
+function getTrackVoteCount(track: ActiveTrack): number {
+  return Array.from(track.votes.values()).reduce((sum, vote) => sum + vote.count, 0);
+}
+
+function isTrackAvailableForReading(track: ActiveTrack): boolean {
+  return track.trackState === 'VISIBLE' && track.visibleThisFrame !== false && (track.missedFrames ?? 0) === 0;
+}
+
+function isTrackDrawable(track: ActiveTrack): boolean {
+  if (track.trackState === 'REMOVED') return false;
+  if (track.trackState === 'VISIBLE') return true;
+  return (track.missedFrames ?? 0) <= 2;
+}
+
+function getMotionOcrMode(track: ActiveTrack): MotionOcrMode {
+  const score = track.motionScore ?? 0;
+  if (score < MOTION_NORMAL_MAX) return 'NORMAL';
+  if (score < MOTION_UNSTABLE_MAX) return 'UNSTABLE';
+  if (score < MOTION_COLLECT_ONLY_MAX) return 'COLLECT_ONLY';
+  return 'PAUSED';
+}
+
+function canAttemptOcrForMotion(track: ActiveTrack, mode: MotionOcrMode): boolean {
+  if (mode === 'NORMAL') return true;
+  if (mode === 'UNSTABLE') return track.framesSeen % 2 === 0;
+  return false;
+}
+
+function getOcrQueuePressure(
+  queueDepth: number,
+  activeJobs: number,
+  maxConcurrency: number
+): OcrQueuePressure {
+  if (queueDepth === 0) return 'EMPTY';
+  if (activeJobs >= maxConcurrency && queueDepth >= maxConcurrency * 2) return 'CRITICAL';
+  if (queueDepth > maxConcurrency * 2) return 'LARGE';
+  if (queueDepth > maxConcurrency) return 'MODERATE';
+  return 'EMPTY';
+}
+
+function shouldSkipTrackForOcrPressure(
+  track: ActiveTrack,
+  pressure: OcrQueuePressure,
+  priorityIndex: number,
+  maxConcurrency: number,
+  qualityScore: number
+): boolean {
+  if (pressure === 'EMPTY') return false;
+  if (pressure === 'MODERATE') return track.framesSeen % 2 !== 0;
+  if (pressure === 'LARGE') {
+    return priorityIndex >= maxConcurrency || (track.trackConfidence ?? 0) < 0.85 || qualityScore < 0.50;
+  }
+
+  return priorityIndex > 0 || (track.trackConfidence ?? 0) < 0.92 || qualityScore < 0.60;
+}
+
 function pruneCooldownMap(cooldowns: Map<string, number>, cooldownMs: number, now: number): void {
   const maxAgeMs = Math.max(cooldownMs * 2, 30000);
   for (const [plate, timestamp] of cooldowns.entries()) {
@@ -244,27 +660,6 @@ function pruneCooldownMap(cooldowns: Map<string, number>, cooldownMs: number, no
   entries.slice(0, COOLDOWN_MAP_MAX_ENTRIES).forEach(([plate, timestamp]) => {
     cooldowns.set(plate, timestamp);
   });
-}
-
-function resetTrackForNextPlate(track: ActiveTrack): void {
-  track.ocrState = 'COLLECTING';
-  track.ocrRunning = false;
-  track.ocrJobQueued = false;
-  track.cooldownActive = false;
-  track.votes.clear();
-  track.cropSamples = [];
-
-  delete track.cooldownStartedAt;
-  delete track.lastCropSampledAt;
-  delete track.lastOcrAttemptAt;
-  delete track.lastOcrCompletedAt;
-  delete track.lastSearchedAt;
-  delete track.stabilizedPlate;
-  delete track.stabilizedConfidence;
-  delete track.matchType;
-  delete track.matchedVehicle;
-  delete track.possibleMatchVehicles;
-  delete track.scanEventId;
 }
 
 function drawRoundedRect(
@@ -429,6 +824,8 @@ export default function ScannerPage() {
   const cameraSlotsRef = useRef<CameraSlot[]>([{ id: 'camera-slot-1', deviceId: '' }]);
   const availableCamerasRef = useRef<MediaDeviceInfo[]>([]);
   const supportsMultiCameraScanRef = useRef(false);
+  const isCameraReadyRef = useRef(false);
+  const isScanningRef = useRef(false);
   const runtimeStateRef = useRef<ANPRRuntimeState>('UNINITIALIZED');
   const vehiclesRef = useRef(vehicles);
   const addHistoryLogRef = useRef(addHistoryLog);
@@ -437,6 +834,11 @@ export default function ScannerPage() {
   const cooldownMap = useRef<Map<string, number>>(new Map());
   const activeOcrCount = useRef(0);
   const lastMetricsFlushTs = useRef(Date.now());
+  const runtimeMetricsRef = useRef<ScannerRuntimeMetrics>(createInitialRuntimeMetrics());
+  const completedTrackEventsRef = useRef<CompletedTrackEvent[]>([]);
+  const lostTrackIdsRef = useRef<Set<string>>(new Set());
+  const stopCameraRef = useRef<(options?: { preserveScanningState?: boolean }) => void>(() => undefined);
+  const startVisibleCamerasRef = useRef<(options?: { resumeScanning?: boolean }) => Promise<boolean>>(async () => false);
 
   const [availableCameras, setAvailableCameras] = useState<MediaDeviceInfo[]>([]);
   const [cameraSlots, setCameraSlots] = useState<CameraSlot[]>([{ id: 'camera-slot-1', deviceId: '' }]);
@@ -447,8 +849,8 @@ export default function ScannerPage() {
   const [isScanning, setIsScanning] = useState(false);
   const [cameraError, setCameraError] = useState('');
   const [soundEnabled, setSoundEnabled] = useState(true);
-  const [currentPlate, setCurrentPlate] = useState('READY');
-  const [lastDetectedSlotId, setLastDetectedSlotId] = useState('');
+  const [, setCurrentPlate] = useState('READY');
+  const [, setLastDetectedSlotId] = useState('');
   const [activeAlertMatch, setActiveAlertMatch] = useState<AlertMatch | null>(null);
   const [liveDetections, setLiveDetections] = useState<SessionDetection[]>([]);
   const [expandedDetectionId, setExpandedDetectionId] = useState<string | null>(null);
@@ -459,9 +861,15 @@ export default function ScannerPage() {
   const [ocrProvider, setOcrProvider] = useState<ActiveOcrProvider>('NONE');
   const [camFps, setCamFps] = useState(0);
   const [detFps, setDetFps] = useState(0);
-  const [platesVisible, setPlatesVisible] = useState(0);
+  const [, setPlatesVisible] = useState(0);
   const [activeTracksCount, setActiveTracksCount] = useState(0);
   const [tracksList, setTracksList] = useState<ActiveTrack[]>([]);
+  const [runtimeMetricsSnapshot, setRuntimeMetricsSnapshot] = useState<ScannerMetricsSnapshot>(() =>
+    createMetricsSnapshot(createInitialRuntimeMetrics(), [])
+  );
+  const [systemHealthSnapshot, setSystemHealthSnapshot] = useState<SystemHealthSnapshot>(() =>
+    createSystemHealthSnapshot(createMetricsSnapshot(createInitialRuntimeMetrics(), []), 0, 0)
+  );
 
   const getSlotRuntime = useCallback((slotId: string): SlotScannerRuntime => {
     if (!slotRuntimesRef.current[slotId]) {
@@ -509,6 +917,10 @@ export default function ScannerPage() {
     setPlatesVisible(aggregate.platesVisible);
     setActiveTracksCount(aggregate.activeTracks);
     setTracksList(aggregate.tracks);
+    runtimeMetricsRef.current.memoryCurrentMb = getUsedHeapMb() ?? runtimeMetricsRef.current.memoryCurrentMb;
+    const snapshot = createMetricsSnapshot(runtimeMetricsRef.current, aggregate.tracks);
+    setRuntimeMetricsSnapshot(snapshot);
+    setSystemHealthSnapshot(createSystemHealthSnapshot(snapshot, aggregate.detFrames, aggregate.camFrames));
 
     Object.values(slotMetricsRef.current).forEach((item) => {
       item.camFrames = 0;
@@ -526,6 +938,14 @@ export default function ScannerPage() {
     slotMetricsRef.current = {};
     activeOcrCount.current = 0;
     lastMetricsFlushTs.current = Date.now();
+    runtimeMetricsRef.current = createInitialRuntimeMetrics(
+      classifyDeviceTier(getLatestBenchmarkResult(), runtimeStateRef.current)
+    );
+    completedTrackEventsRef.current = [];
+    lostTrackIdsRef.current.clear();
+    const emptySnapshot = createMetricsSnapshot(runtimeMetricsRef.current, []);
+    setRuntimeMetricsSnapshot(emptySnapshot);
+    setSystemHealthSnapshot(createSystemHealthSnapshot(emptySnapshot, 0, 0));
     setTracksList([]);
     setPlatesVisible(0);
     setActiveTracksCount(0);
@@ -539,12 +959,14 @@ export default function ScannerPage() {
 
   const syncRuntimeStatus = useCallback(() => {
     const nextState = getANPRRuntimeState();
+    const latestBenchmark = getLatestBenchmarkResult();
     runtimeStateRef.current = nextState;
     setRuntimeState((prev) => (prev === nextState ? prev : nextState));
-    setBenchmarkResult(getLatestBenchmarkResult());
+    setBenchmarkResult(latestBenchmark);
     setRuntimeErrorMessage(getRuntimeErrorMessage());
     setDetectorProvider(getActiveDetectorProvider());
     setOcrProvider(getActivePpOcrProvider());
+    runtimeMetricsRef.current.deviceTier = classifyDeviceTier(latestBenchmark, nextState);
   }, []);
 
   const startRuntimeInit = useCallback(async () => {
@@ -579,6 +1001,14 @@ export default function ScannerPage() {
   useEffect(() => {
     activeCameraSlotIdRef.current = activeCameraSlotId;
   }, [activeCameraSlotId]);
+
+  useEffect(() => {
+    isCameraReadyRef.current = isCameraReady;
+  }, [isCameraReady]);
+
+  useEffect(() => {
+    isScanningRef.current = isScanning;
+  }, [isScanning]);
 
   useEffect(() => {
     supportsMultiCameraScanRef.current = supportsMultiCameraScan;
@@ -634,6 +1064,7 @@ export default function ScannerPage() {
         0.35,
         0.7
       ),
+      debugMode: false,
     };
   }, [settings, soundEnabled]);
 
@@ -647,6 +1078,11 @@ export default function ScannerPage() {
       window.clearInterval(id);
     };
   }, [startRuntimeInit, syncRuntimeStatus]);
+
+  useEffect(() => {
+    stopCameraRef.current = stopCamera;
+    startVisibleCamerasRef.current = startVisibleCameras;
+  });
 
   useEffect(() => {
     const restoreTimer = window.setTimeout(() => {
@@ -669,15 +1105,15 @@ export default function ScannerPage() {
 
     return () => {
       window.clearTimeout(restoreTimer);
-      stopCamera();
+      stopCameraRef.current();
     };
   }, []);
 
   useEffect(() => {
-    if (!isCameraReady) return;
-    const resumeScanning = isScanning;
+    if (!isCameraReadyRef.current) return;
+    const resumeScanning = isScanningRef.current;
     window.setTimeout(() => {
-      void startVisibleCameras({ resumeScanning });
+      void startVisibleCamerasRef.current({ resumeScanning });
     }, 0);
   }, [cameraSlots.length]);
 
@@ -918,8 +1354,10 @@ export default function ScannerPage() {
 
       if (commitNoCase && now - lastSearch < cooldownMs) {
         track.ocrState = 'COOLDOWN';
+        track.pipelineState = 'COOLDOWN';
         track.cooldownActive = true;
         track.cooldownStartedAt = now;
+        runtimeMetricsRef.current.duplicateOcrSkippedCount++;
         return;
       }
 
@@ -929,6 +1367,7 @@ export default function ScannerPage() {
 
       track.lastSearchedAt = now;
       track.ocrState = 'DB_CHECKING';
+      track.pipelineState = 'CONSENSUS';
 
       const vehicleCases = vehiclesRef.current.map(mapVehicleToCase);
       const evaluation = evaluateDatabaseMatch(
@@ -952,6 +1391,7 @@ export default function ScannerPage() {
 
       if (!commitNoCase && resolvedMatchType === 'NONE') {
         track.ocrState = 'CONSENSUS_BUILDING';
+        track.pipelineState = 'CONSENSUS';
         return;
       }
 
@@ -1012,11 +1452,56 @@ export default function ScannerPage() {
         statusMatch: resolvedMatchType,
       });
 
+      const completedAt = Date.now();
+      const startedAt = track.stats?.startedAt ?? completedAt;
+      const consensusCount = Array.from(track.votes.values()).reduce((sum, vote) => sum + vote.count, 0);
+      const processingTimeMs = Math.max(0, completedAt - startedAt);
+      runtimeMetricsRef.current.completedTrackCount++;
+      runtimeMetricsRef.current.trackLifetimeTotalMs += processingTimeMs;
+      if (track.stats) {
+        track.stats.finishedAt = completedAt;
+        track.stats.finalConfidence = confidence;
+      }
+      completedTrackEventsRef.current.unshift({
+        id: detectionId,
+        trackId: track.trackId,
+        plate: normalizedPlate,
+        startedAt: new Date(startedAt).toISOString(),
+        endedAt: new Date(completedAt).toISOString(),
+        durationMs: processingTimeMs,
+        detectorConfidence: Math.round((track.bbox.confidence ?? 0) * 100) / 100,
+        detectorLatencyMs: track.stats?.lastDetectorLatencyMs ?? Math.round(runtimeMetricsRef.current.detectorLatencySamples > 0
+          ? runtimeMetricsRef.current.detectorLatencyTotalMs / runtimeMetricsRef.current.detectorLatencySamples
+          : 0),
+        trackConfidence: Math.round((track.trackConfidence ?? 0) * 100) / 100,
+        confidenceComponents: track.confidenceComponents,
+        ocrConfidence: Math.round(confidence * 100) / 100,
+        ocrLatencyMs: track.stats?.lastOcrLatencyMs ?? Math.round(runtimeMetricsRef.current.ocrLatencySamples > 0
+          ? runtimeMetricsRef.current.ocrLatencyTotalMs / runtimeMetricsRef.current.ocrLatencySamples
+          : 0),
+        consensusCount,
+        matchType: resolvedMatchType,
+        motionLevel: getMotionOcrMode(track),
+        cropQuality: Math.round((track.stats?.bestCropQuality ?? 0) * 100) / 100,
+        processingTimeMs,
+        reasonForCompletion:
+          resolvedMatchType === 'EXACT'
+            ? 'DATABASE_EXACT_MATCH'
+            : resolvedMatchType === 'POSSIBLE'
+            ? 'DATABASE_POSSIBLE_MATCH'
+            : 'DATABASE_NO_MATCH',
+        deviceTier: runtimeMetricsRef.current.deviceTier,
+      });
+      if (completedTrackEventsRef.current.length > 500) {
+        completedTrackEventsRef.current.length = 500;
+      }
+
       track.matchType = resolvedMatchType;
       track.matchedVehicle = matchedVehicle ?? undefined;
       track.possibleMatchVehicles = possibleVehicles;
       track.ocrState =
         resolvedMatchType === 'EXACT' ? 'MATCHED' : resolvedMatchType === 'POSSIBLE' ? 'POSSIBLE MATCH' : 'NO CASE';
+      track.pipelineState = resolvedMatchType === 'EXACT' ? 'MATCHED' : 'COOLDOWN';
       track.scanEventId = detectionId;
 
       if (resolvedMatchType === 'EXACT' && matchedVehicle) {
@@ -1025,6 +1510,7 @@ export default function ScannerPage() {
       }
 
       track.ocrState = 'COOLDOWN';
+      track.pipelineState = 'COOLDOWN';
       track.cooldownActive = true;
       track.cooldownStartedAt = Date.now();
     },
@@ -1051,6 +1537,7 @@ export default function ScannerPage() {
       let detectionTimeout: ReturnType<typeof setTimeout> | undefined;
       let lastVideoTime = -1;
       let lastDetectorValidationAt = 0;
+      let adaptiveDetectorIntervalMs = DETECTION_TARGET_INTERVAL_MS;
 
       const scheduleDetection = (delay = 100) => {
         if (stopped) return;
@@ -1109,6 +1596,15 @@ export default function ScannerPage() {
           console.warn(`[Scanner:${slotId}] Detector frame failed:`, err);
         }
 
+        const detectorElapsedMs = performance.now() - detectionStartedAt;
+        const runtimeMetrics = runtimeMetricsRef.current;
+        runtimeMetrics.detectorLatencyTotalMs += detectorElapsedMs;
+        runtimeMetrics.detectorLatencySamples++;
+        pushBoundedMetricSample(runtimeMetrics.detectorLatencyHistoryMs, detectorElapsedMs);
+        if (detectorElapsedMs > adaptiveDetectorIntervalMs * 1.5) {
+          runtimeMetrics.droppedFrameCount++;
+        }
+
         if (detectedPlates.length === 0) {
           const now = Date.now();
           if (now - lastDetectorValidationAt > DETECTOR_VALIDATION_INTERVAL_MS) {
@@ -1127,21 +1623,25 @@ export default function ScannerPage() {
 
         const allTracks = runtime.tracker.updateTracks(bboxList);
         const confirmedTracks = runtime.tracker.getActiveTracks(true);
-        const displayTracks = scannerSettings.debugMode ? allTracks : confirmedTracks;
+        const readableConfirmedTracks = confirmedTracks.filter(isTrackAvailableForReading);
+        const displayTracks = (scannerSettings.debugMode ? allTracks : confirmedTracks).filter(isTrackDrawable);
         const loopNow = Date.now();
 
         confirmedTracks.forEach((track) => {
-          if (track.cooldownActive && !track.cooldownStartedAt) {
-            track.cooldownStartedAt = loopNow;
+          if (track.trackState === 'LOST' && !lostTrackIdsRef.current.has(track.trackId)) {
+            lostTrackIdsRef.current.add(track.trackId);
+            runtimeMetricsRef.current.lostTrackObservations++;
+          } else if (track.trackState === 'VISIBLE' && lostTrackIdsRef.current.has(track.trackId)) {
+            lostTrackIdsRef.current.delete(track.trackId);
+            runtimeMetricsRef.current.reacquiredTrackCount++;
           }
 
-          if (
-            track.cooldownActive &&
-            track.cooldownStartedAt &&
-            loopNow - track.cooldownStartedAt >= TRACK_RESULT_HOLD_MS
-          ) {
-            resetTrackForNextPlate(track);
-            runtime.bestFrameSelector.clearTrack(track.trackNumber);
+          if (track.trackState === 'VISIBLE' && track.stats) {
+            track.stats.lastDetectorLatencyMs = Math.round(detectorElapsedMs);
+          }
+
+          if (track.cooldownActive && !track.cooldownStartedAt) {
+            track.cooldownStartedAt = loopNow;
           }
         });
 
@@ -1154,32 +1654,59 @@ export default function ScannerPage() {
         }
 
         metrics.platesVisible = bboxList.length;
-        metrics.activeTracks = confirmedTracks.length;
+        metrics.activeTracks = readableConfirmedTracks.length;
         metrics.tracks = [...displayTracks];
 
         const cropSampleNow = loopNow;
         confirmedTracks.forEach((track) => {
+          if (!isTrackAvailableForReading(track)) return;
+
           if (!track.lastOverlayAngleAt || cropSampleNow - track.lastOverlayAngleAt >= OVERLAY_ANGLE_SAMPLE_MS) {
             track.overlayAngle = estimatePlateOverlayAngle(processingCanvas, track.bbox, track.overlayAngle ?? 0);
             track.lastOverlayAngleAt = cropSampleNow;
           }
 
           if (track.ocrState === 'COOLDOWN' || track.ocrState === 'MATCHED') return;
+          const motionMode = getMotionOcrMode(track);
+          runtimeMetricsRef.current.motionBuckets[motionMode]++;
+
+          if (motionMode === 'PAUSED') {
+            track.pipelineState = 'TRACKING';
+            return;
+          }
+
           const existingCrop = runtime.bestFrameSelector.getBestCrop(track.trackNumber);
           const sampleInterval = track.bbox.confidence >= 0.7 ? CROP_SAMPLE_FAST_MS : CROP_SAMPLE_NORMAL_MS;
           if (existingCrop && track.lastCropSampledAt && cropSampleNow - track.lastCropSampledAt < sampleInterval) {
             return;
           }
 
+          track.pipelineState = 'COLLECTING';
           const cropCanvas = cropCanvasRegionFast(processingCanvas, track.bbox);
-          runtime.bestFrameSelector.addCropCandidate(track.trackNumber, cropCanvas, track.bbox);
+          const cropQuality = runtime.bestFrameSelector.addCropCandidate(track.trackNumber, cropCanvas, track.bbox);
+          runtimeMetricsRef.current.cropQualityTotal += cropQuality.overallScore;
+          runtimeMetricsRef.current.cropQualitySamples++;
+          if (track.stats) {
+            track.stats.bestCropQuality = Math.max(track.stats.bestCropQuality ?? 0, cropQuality.overallScore);
+          }
           track.lastCropSampledAt = cropSampleNow;
         });
 
-        processOcrQueue(confirmedTracks, processingCanvas, scannerSettings, runtime, slotId);
+        processOcrQueue(readableConfirmedTracks, processingCanvas, scannerSettings, runtime, slotId);
         metrics.detFrames++;
 
-        const targetInterval = activeOcrCount.current > 0 ? DETECTION_BUSY_INTERVAL_MS : DETECTION_TARGET_INTERVAL_MS;
+        const latencyDrivenInterval = clampNumber(
+          Math.round(detectorElapsedMs * 1.45),
+          getTierDetectorTargetMs(runtimeMetricsRef.current.deviceTier),
+          250
+        );
+        adaptiveDetectorIntervalMs = Math.round(
+          adaptiveDetectorIntervalMs * 0.75 + latencyDrivenInterval * 0.25
+        );
+        const targetInterval =
+          activeOcrCount.current > 0
+            ? Math.max(adaptiveDetectorIntervalMs, DETECTION_BUSY_INTERVAL_MS)
+            : adaptiveDetectorIntervalMs;
         const nextDelay = Math.max(
           DETECTION_MIN_DELAY_MS,
           Math.round(targetInterval - (performance.now() - detectionStartedAt))
@@ -1198,6 +1725,7 @@ export default function ScannerPage() {
           confirmedTracks.forEach((track) => {
             if (!track.cooldownActive && track.ocrState !== 'MATCHED') {
               track.ocrState = 'COLLECTING';
+              track.pipelineState = 'COLLECTING';
             }
           });
           return;
@@ -1214,27 +1742,68 @@ export default function ScannerPage() {
             framesSeen: track.framesSeen,
             ocrState: track.ocrState,
             lastOcrAttemptAt: track.lastOcrAttemptAt,
-            voteCount: Array.from(track.votes.values()).reduce((sum, vote) => sum + vote.count, 0),
+            voteCount: getTrackVoteCount(track),
           })),
           canvas.width,
           canvas.height,
+          Math.max(maxOcrConcurrency, confirmedTracks.length)
+        );
+        const ocrQueuePressure = getOcrQueuePressure(
+          priorityIds.length,
+          activeOcrCount.current,
           maxOcrConcurrency
         );
+        runtimeMetricsRef.current.lastOcrQueueDepth = priorityIds.length;
+        runtimeMetricsRef.current.maxOcrQueueDepth = Math.max(
+          runtimeMetricsRef.current.maxOcrQueueDepth,
+          priorityIds.length
+        );
 
-        for (const trackId of priorityIds) {
+        for (let priorityIndex = 0; priorityIndex < priorityIds.length; priorityIndex++) {
+          const trackId = priorityIds[priorityIndex];
           const track = slotRuntime.tracker.getTrack(trackId);
-          if (!track || !track.isConfirmed || track.ocrRunning || track.cooldownActive) continue;
+          if (!track || !track.isConfirmed || track.cooldownActive) continue;
+          if (track.ocrRunning || track.ocrJobQueued) {
+            runtimeMetricsRef.current.duplicateOcrSkippedCount++;
+            continue;
+          }
+          if (!isTrackAvailableForReading(track)) continue;
           if (activeOcrCount.current >= maxOcrConcurrency) break;
 
           const now = Date.now();
-          const voteCount = Array.from(track.votes.values()).reduce((sum, vote) => sum + vote.count, 0);
+          const voteCount = getTrackVoteCount(track);
           const retryDelay = voteCount === 0 ? OCR_FIRST_READ_RETRY_MS : OCR_REPEAT_READ_RETRY_MS;
           if (track.lastOcrAttemptAt && now - track.lastOcrAttemptAt < retryDelay) continue;
 
-          const minReadableWidth = Math.max(40, scannerSettings.minCropWidth || INITIAL_SETTINGS.minCropWidth);
-          const canReadFirstFrame = track.framesSeen >= 2 || track.bbox.confidence >= 0.6;
-          if (!canReadFirstFrame || track.bbox.width < minReadableWidth) {
+          const motionMode = getMotionOcrMode(track);
+          if (!canAttemptOcrForMotion(track, motionMode)) {
             track.ocrState = 'COLLECTING';
+            track.pipelineState = motionMode === 'PAUSED' ? 'TRACKING' : 'COLLECTING';
+            continue;
+          }
+
+          if ((track.trackConfidence ?? 0) < OCR_MIN_TRACK_CONFIDENCE) {
+            track.ocrState = 'COLLECTING';
+            track.pipelineState = 'TRACKING';
+            continue;
+          }
+
+          const minReadableWidth = Math.max(
+            OCR_DEFAULT_MIN_READABLE_WIDTH,
+            scannerSettings.minCropWidth || INITIAL_SETTINGS.minCropWidth
+          );
+          const bufferedCropCount = slotRuntime.bestFrameSelector.getCropCount(track.trackNumber);
+          const requiredCropCount = voteCount === 0 ? OCR_MIN_BUFFERED_CROPS : 1;
+          const hasEnoughBufferedCrops = bufferedCropCount >= requiredCropCount;
+          const canReadFirstFrame = track.framesSeen >= OCR_MIN_TRACK_FRAMES || track.bbox.confidence >= 0.78;
+
+          if (
+            !canReadFirstFrame ||
+            !hasEnoughBufferedCrops ||
+            track.bbox.width < minReadableWidth
+          ) {
+            track.ocrState = 'COLLECTING';
+            track.pipelineState = 'COLLECTING';
             continue;
           }
 
@@ -1242,18 +1811,49 @@ export default function ScannerPage() {
           const targetCropFromBest = !!bestFrameEntry?.canvas;
           const targetCrop = bestFrameEntry?.canvas ?? cropCanvasRegionFast(canvas, track.bbox);
           const qualityReport = bestFrameEntry?.quality || { overallScore: 0.6, recommendation: 'MARGINAL' as const };
-          if (qualityReport.recommendation === 'REJECT') {
+          const bestCropAge = bestFrameEntry ? now - bestFrameEntry.timestamp : 0;
+          const minQualityForOcr = Math.max(
+            scannerSettings.minCropQuality || INITIAL_SETTINGS.minCropQuality,
+            voteCount === 0 ? OCR_FIRST_READ_MIN_QUALITY : OCR_REPEAT_READ_MIN_QUALITY
+          );
+
+          if (
+            (voteCount === 0 && bestCropAge > OCR_MAX_BEST_CROP_AGE_MS) ||
+            qualityReport.recommendation === 'REJECT' ||
+            qualityReport.overallScore < minQualityForOcr
+          ) {
             track.ocrState = 'LOW QUALITY';
+            track.pipelineState = 'COLLECTING';
             continue;
           }
 
+          if (
+            shouldSkipTrackForOcrPressure(
+              track,
+              ocrQueuePressure,
+              priorityIndex,
+              maxOcrConcurrency,
+              qualityReport.overallScore
+            )
+          ) {
+            track.ocrState = 'COLLECTING';
+            track.pipelineState = 'COLLECTING';
+            runtimeMetricsRef.current.ocrSkippedQueuePressureCount++;
+            continue;
+          }
+
+          track.pipelineState = 'READY_FOR_OCR';
           track.ocrRunning = true;
           track.ocrJobQueued = true;
           track.lastOcrAttemptAt = now;
           track.ocrState = 'OCR_RUNNING';
+          track.pipelineState = 'READING';
+          if (track.stats) track.stats.ocrAttempts++;
+          runtimeMetricsRef.current.ocrAttemptCount++;
           activeOcrCount.current++;
 
           void (async () => {
+            const ocrStartedAt = performance.now();
             const transientCanvases: HTMLCanvasElement[] = [];
             const rememberTransientCanvas = (crop?: HTMLCanvasElement | null) => {
               if (crop && !transientCanvases.includes(crop)) {
@@ -1338,11 +1938,14 @@ export default function ScannerPage() {
               }
 
               const updatedTrack = slotRuntime.tracker.getTrack(trackId);
-              if (!updatedTrack || updatedTrack.cooldownActive) return;
+              if (!updatedTrack || updatedTrack.cooldownActive || !isTrackAvailableForReading(updatedTrack)) return;
 
               if (text && conf >= 0.25) {
                 addOcrVoteToTrack(updatedTrack, text, conf, qualityReport.overallScore);
+                if (updatedTrack.stats) updatedTrack.stats.ocrAccepted++;
+                runtimeMetricsRef.current.ocrAcceptedCount++;
                 updatedTrack.ocrState = 'CONSENSUS_BUILDING';
+                updatedTrack.pipelineState = 'CONSENSUS';
 
                 const { digits } = countPlateChars(text);
                 const canFastMatch = bestPatternValid && digits >= (text.length >= 5 ? 2 : 1);
@@ -1359,6 +1962,8 @@ export default function ScannerPage() {
                   : strongRead
                     ? Math.min(scannerSettings.recognitionThreshold, 0.45)
                     : scannerSettings.recognitionThreshold;
+                if (updatedTrack.stats) updatedTrack.stats.consensusAttempts++;
+                runtimeMetricsRef.current.consensusAttemptCount++;
                 const consensus = evaluateConsensus(updatedTrack, requiredVotes, confidenceGate);
 
                 if (consensus.isStabilized) {
@@ -1372,16 +1977,30 @@ export default function ScannerPage() {
                 }
               } else if (updatedTrack.votes.size === 0) {
                 updatedTrack.ocrState = 'COLLECTING';
+                updatedTrack.pipelineState = 'COLLECTING';
+              } else {
+                updatedTrack.ocrState = 'CONSENSUS_BUILDING';
+                updatedTrack.pipelineState = 'CONSENSUS';
               }
             } catch (err) {
               console.warn(`[OCR:${sourceSlotId}] Error:`, err);
             } finally {
               transientCanvases.forEach(releaseCanvasMemory);
+              const ocrElapsedMs = performance.now() - ocrStartedAt;
+              runtimeMetricsRef.current.ocrLatencyTotalMs += ocrElapsedMs;
+              runtimeMetricsRef.current.ocrLatencySamples++;
+              pushBoundedMetricSample(runtimeMetricsRef.current.ocrLatencyHistoryMs, ocrElapsedMs);
               const refreshedTrack = slotRuntime.tracker.getTrack(trackId);
               if (refreshedTrack) {
                 refreshedTrack.ocrRunning = false;
                 refreshedTrack.ocrJobQueued = false;
                 refreshedTrack.lastOcrCompletedAt = Date.now();
+                if (refreshedTrack.stats) {
+                  refreshedTrack.stats.lastOcrLatencyMs = Math.round(ocrElapsedMs);
+                }
+                if (refreshedTrack.pipelineState === 'READING' && !refreshedTrack.cooldownActive) {
+                  refreshedTrack.pipelineState = isTrackAvailableForReading(refreshedTrack) ? 'COLLECTING' : 'TRACKING';
+                }
               }
               activeOcrCount.current = Math.max(0, activeOcrCount.current - 1);
             }
@@ -1403,9 +2022,9 @@ export default function ScannerPage() {
           if (overlayCtx) {
             overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
             const scannerSettings = settingsRef.current;
-            const displayTracks = scannerSettings.debugMode
+            const displayTracks = (scannerSettings.debugMode
               ? runtime.tracker.getActiveTracks(false)
-              : runtime.tracker.getActiveTracks(true);
+              : runtime.tracker.getActiveTracks(true)).filter(isTrackDrawable);
             drawOverlays(
               overlayCtx,
               overlayCanvas.width,
@@ -1576,6 +2195,62 @@ export default function ScannerPage() {
     }
   };
 
+  const handleExportScannerMetrics = () => {
+    const snapshot = createMetricsSnapshot(runtimeMetricsRef.current, tracksList);
+    const health = createSystemHealthSnapshot(snapshot, detFps, camFps);
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      device: typeof navigator !== 'undefined'
+        ? {
+            userAgent: navigator.userAgent,
+            hardwareConcurrency: navigator.hardwareConcurrency,
+          }
+        : null,
+      benchmark: benchmarkResult,
+      performanceTargets: SCANNER_PERFORMANCE_TARGETS,
+      health,
+      metrics: snapshot,
+      detectorMetrics: {
+        medianLatencyMs: snapshot.detectorLatencyMedianMs,
+        p95LatencyMs: snapshot.detectorLatencyP95Ms,
+        averageLatencyMs: snapshot.detectorLatencyAvgMs,
+        fps: detFps,
+        frames: snapshot.detectorLatencySamples,
+      },
+      ocrMetrics: {
+        medianLatencyMs: snapshot.ocrLatencyMedianMs,
+        p95LatencyMs: snapshot.ocrLatencyP95Ms,
+        averageLatencyMs: snapshot.ocrLatencyAvgMs,
+        attempts: snapshot.ocrAttemptCount,
+        accepted: snapshot.ocrAcceptedCount,
+        duplicateRate: snapshot.duplicateOcrRate,
+        queuePressureSkips: snapshot.ocrSkippedQueuePressureCount,
+      },
+      databaseMetrics: {
+        completedEvents: completedTrackEventsRef.current.length,
+        falseExactMatches: snapshot.falseAlertCount,
+        exactMatches: completedTrackEventsRef.current.filter((event) => event.matchType === 'EXACT').length,
+        possibleMatches: completedTrackEventsRef.current.filter((event) => event.matchType === 'POSSIBLE').length,
+        noMatches: completedTrackEventsRef.current.filter((event) => event.matchType === 'NONE').length,
+      },
+      completedTrackEvents: completedTrackEventsRef.current,
+      activeTracks: tracksList.map((track) => ({
+        trackId: track.trackId,
+        state: track.trackState,
+        pipelineState: track.pipelineState,
+        framesSeen: track.framesSeen,
+        missedFrames: track.missedFrames ?? 0,
+        motionScore: track.motionScore ?? 0,
+        trackConfidence: track.trackConfidence ?? 0,
+        confidenceComponents: track.confidenceComponents,
+        stats: track.stats,
+        currentPlate: getTrackPlateText(track),
+      })),
+    };
+
+    downloadJson(`track_scanner_metrics_${Date.now()}.json`, payload);
+  };
+
   const runtimeReady = isRuntimeScanningReady(runtimeState);
   const visibleTrack = tracksList.find((track) => getTrackPlateText(track)) || tracksList[0] || null;
   const activeScanTileCount = supportsMultiCameraScan
@@ -1611,6 +2286,8 @@ export default function ScannerPage() {
       ? 'NONE'
       : null;
 
+  const showDeveloperOverlay = false;
+
   return (
     <div className="space-y-4 max-w-6xl mx-auto px-1 sm:px-0">
       <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3 sm:p-4 shadow-xl flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
@@ -1633,14 +2310,6 @@ export default function ScannerPage() {
         </div>
 
         <div className="flex items-center justify-end gap-2">
-            {isScanning && (
-              <div className="hidden lg:flex items-center gap-1.5 font-mono text-[10px] text-slate-400">
-                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">CAM {camFps}</span>
-                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">AI {detFps}</span>
-                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">PLT {platesVisible}</span>
-                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">TRK {activeTracksCount}</span>
-              </div>
-            )}
             {supportsMultiCameraScan && (
               <button
                 type="button"
@@ -1696,7 +2365,7 @@ export default function ScannerPage() {
           ocrProvider={ocrProvider}
           benchmark={benchmarkResult}
           errorMessage={runtimeErrorMessage}
-          debugMode={false}
+          debugMode={showDeveloperOverlay}
           onRetry={startRuntimeInit}
           onManualSearch={() => {
             window.location.href = '/search';
@@ -1718,14 +2387,6 @@ export default function ScannerPage() {
         >
           {cameraSlots.map((slot, index) => {
             const slotLabel = getCameraSlotLabel(slot, index);
-            const isActiveSlot = activeCameraSlotId === slot.id;
-            const isScanningSlot =
-              isScanning &&
-              (supportsMultiCameraScan
-                ? previewSlotIds.includes(slot.id)
-                : lastDetectedSlotId
-                  ? lastDetectedSlotId === slot.id
-                  : isActiveSlot);
             const isAlertSlot = activeAlertMatch?.cameraId === slot.id;
 
             return (
@@ -1735,8 +2396,6 @@ export default function ScannerPage() {
                 className={`relative min-h-[420px] sm:min-h-0 rounded-xl overflow-hidden border bg-slate-950 text-left transition-all ${
                   isAlertSlot
                     ? 'border-red-500 ring-2 ring-red-500/40'
-                    : isActiveSlot
-                    ? 'border-cyan-500/70 ring-1 ring-cyan-500/30'
                     : 'border-slate-800'
                 }`}
               >
@@ -1762,14 +2421,6 @@ export default function ScannerPage() {
                   </div>
                 )}
 
-                {isScanningSlot && (
-                  <>
-                    <div className="absolute inset-0 bg-[linear-gradient(rgba(6,182,212,0.10)_1px,transparent_1px),linear-gradient(90deg,rgba(6,182,212,0.10)_1px,transparent_1px)] bg-[size:48px_48px]" />
-                    <div className="absolute inset-x-0 h-0.5 bg-cyan-400/90 animate-laser shadow-[0_0_16px_#06B6D4]" />
-                    <div className="absolute inset-4 border border-cyan-400/40 rounded-lg shadow-[0_0_30px_rgba(6,182,212,0.20)_inset]" />
-                  </>
-                )}
-
                 <canvas
                   ref={(node) => {
                     canvasRefs.current[slot.id] = node;
@@ -1778,7 +2429,6 @@ export default function ScannerPage() {
                 />
 
                 <div className="absolute inset-x-2.5 top-2.5 z-20 flex items-center gap-1.5">
-                  <span className={`h-2 w-2 rounded-full shrink-0 ${isAlertSlot ? 'bg-red-400 animate-pulse' : isScanningSlot ? 'bg-emerald-400 animate-pulse' : previewSlotIds.includes(slot.id) ? 'bg-cyan-400' : 'bg-slate-500'}`} />
                   <select
                     value={slot.deviceId}
                     onClick={(event) => event.stopPropagation()}
@@ -1819,16 +2469,6 @@ export default function ScannerPage() {
                   )}
                 </div>
 
-                {isActiveSlot && (
-                  <div className="absolute bottom-2.5 left-2.5 bg-cyan-950/90 text-cyan-200 border border-cyan-500/60 rounded-lg px-2.5 py-1 text-[10px] font-bold">
-                    {supportsMultiCameraScan && isScanning ? 'Selected view' : 'Active scanner'}
-                  </div>
-                )}
-                {isScanningSlot && (
-                  <div className={`absolute bottom-2.5 ${isActiveSlot ? 'left-32' : 'left-2.5'} bg-slate-900/90 text-cyan-200 border border-cyan-700 rounded-lg px-2.5 py-1 text-[10px] font-mono font-black`}>
-                    {supportsMultiCameraScan && currentPlate === 'SCANNING' ? 'SCANNING' : currentPlate}
-                  </div>
-                )}
                 {supportsMultiCameraScan && (
                   <button
                     type="button"
@@ -1855,6 +2495,7 @@ export default function ScannerPage() {
                       <button
                         onClick={(event) => {
                           event.stopPropagation();
+                          runtimeMetricsRef.current.falseAlertCount++;
                           setActiveAlertMatch(null);
                         }}
                         className="p-1 rounded-lg bg-red-700 hover:bg-red-800 text-white transition-all"
@@ -1913,6 +2554,91 @@ export default function ScannerPage() {
           })}
         </div>
       </div>
+
+      {showDeveloperOverlay && (
+        <div className="rounded-2xl border border-cyan-900/70 bg-slate-950/95 p-3 shadow-xl">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <div>
+              <div className="text-[10px] font-black uppercase tracking-wider text-cyan-300">Developer Metrics</div>
+              <div className="text-[10px] text-slate-500">
+                Tier {runtimeMetricsSnapshot.deviceTier} · Health {systemHealthSnapshot.overallScore}% · {completedTrackEventsRef.current.length} completed track events
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleExportScannerMetrics}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-800 bg-cyan-950 px-2.5 py-1.5 text-[10px] font-bold text-cyan-200 hover:bg-cyan-900"
+            >
+              <Download className="h-3.5 w-3.5" />
+              <span>Export</span>
+            </button>
+          </div>
+
+          <div className="mb-2 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+            {systemHealthSnapshot.components.map((component) => (
+              <div key={component.label} className="rounded-lg border border-slate-800 bg-slate-900 px-2.5 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[9px] font-bold uppercase text-slate-500">{component.label}</div>
+                  <div
+                    className={`text-[9px] font-black ${
+                      component.status === 'OK'
+                        ? 'text-emerald-300'
+                        : component.status === 'WARN'
+                        ? 'text-amber-300'
+                        : component.status === 'FAIL'
+                        ? 'text-red-300'
+                        : 'text-slate-400'
+                    }`}
+                  >
+                    {component.status}
+                  </div>
+                </div>
+                <div className="mt-0.5 font-mono text-xs font-black text-slate-100">{component.score}%</div>
+                <div className="mt-0.5 truncate text-[9px] text-slate-500">{component.detail}</div>
+              </div>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
+            {[
+              ['Camera FPS', camFps.toFixed(0)],
+              ['Detector FPS', detFps.toFixed(0)],
+              ['Detector P50', `${runtimeMetricsSnapshot.detectorLatencyMedianMs.toFixed(0)} ms`],
+              ['Detector P95', `${runtimeMetricsSnapshot.detectorLatencyP95Ms.toFixed(0)} ms`],
+              ['OCR P50', `${runtimeMetricsSnapshot.ocrLatencyMedianMs.toFixed(0)} ms`],
+              ['OCR P95', `${runtimeMetricsSnapshot.ocrLatencyP95Ms.toFixed(0)} ms`],
+              ['Tracks', activeTracksCount.toFixed(0)],
+              ['Lost', runtimeMetricsSnapshot.lostTrackObservations.toFixed(0)],
+              ['OCR queue', runtimeMetricsSnapshot.lastOcrQueueDepth.toFixed(0)],
+              ['Avg conf', `${Math.round(runtimeMetricsSnapshot.averageTrackConfidence * 100)}%`],
+              ['Crop quality', `${Math.round(runtimeMetricsSnapshot.cropQualityAvg * 100)}%`],
+              ['Consensus', runtimeMetricsSnapshot.consensusAttemptCount.toFixed(0)],
+              ['OCR attempts', runtimeMetricsSnapshot.ocrAttemptCount.toFixed(0)],
+              ['Dup skips', runtimeMetricsSnapshot.duplicateOcrSkippedCount.toFixed(0)],
+              ['Queue skips', runtimeMetricsSnapshot.ocrSkippedQueuePressureCount.toFixed(0)],
+              ['Track loss', `${Math.round(runtimeMetricsSnapshot.trackLossRate * 100)}%`],
+              ['Dropped', runtimeMetricsSnapshot.droppedFrameCount.toFixed(0)],
+              ['False alerts', runtimeMetricsSnapshot.falseAlertCount.toFixed(0)],
+              ['Target det P95', `<${SCANNER_PERFORMANCE_TARGETS.detectorP95LatencyMs} ms`],
+              ['Target OCR P95', `<${SCANNER_PERFORMANCE_TARGETS.ocrP95LatencyMs} ms`],
+            ].map(([label, value]) => (
+              <div key={label} className="rounded-lg border border-slate-800 bg-slate-900 px-2.5 py-2">
+                <div className="text-[9px] font-bold uppercase text-slate-500">{label}</div>
+                <div className="mt-0.5 font-mono text-xs font-black text-slate-100">{value}</div>
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {Object.entries(runtimeMetricsSnapshot.motionBuckets).map(([bucket, count]) => (
+              <div key={bucket} className="rounded-lg border border-slate-800 bg-slate-900 px-2.5 py-2">
+                <div className="text-[9px] font-bold uppercase text-slate-500">{bucket.replace('_', ' ')}</div>
+                <div className="mt-0.5 font-mono text-xs font-black text-cyan-200">{count}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {latestDetection && latestResultTone && (
         <div

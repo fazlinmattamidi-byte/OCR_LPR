@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { PlateTracker, BoundingBox } from '../lib/anpr/tracker';
+import { PlateTracker } from '../lib/anpr/tracker';
 import { validateMalaysianPattern } from '../lib/anpr/patterns';
 
 describe('FAT Tests: Tracker Scenarios and Plate Types', () => {
@@ -118,7 +118,7 @@ describe('FAT Tests: Tracker Scenarios and Plate Types', () => {
 
   it('FAT Scenario 7: Multi-vehicle validation scaling (1 to 5 plates)', () => {
     // 1 plate
-    let boxes = [{ x: 10, y: 10, width: 80, height: 30, confidence: 0.9 }];
+    const boxes = [{ x: 10, y: 10, width: 80, height: 30, confidence: 0.9 }];
     let tracks = tracker.updateTracks(boxes);
     expect(tracks.length).toBe(1);
 
@@ -205,5 +205,80 @@ describe('FAT Tests: Tracker Scenarios and Plate Types', () => {
     tracks = tracker.updateTracks([{ x: 135, y: 108, width: 90, height: 30, confidence: 0.8 }]);
     expect(tracks[0].trackId).toBe(trackId);
     expect(tracker.getTrack(trackId)?.lastSeenTimestamp).toBe(4200);
+  });
+
+  it('FAT Scenario 11: missed tracks stay alive but are not visible for OCR', () => {
+    let tracks = tracker.updateTracks([{ x: 100, y: 100, width: 90, height: 30, confidence: 0.9 }]);
+    const trackId = tracks[0].trackId;
+    expect(tracks[0].visibleThisFrame).toBe(true);
+    expect(tracks[0].missedFrames).toBe(0);
+
+    tracks = tracker.updateTracks([]);
+    const retainedTrack = tracker.getTrack(trackId);
+
+    expect(retainedTrack).toBeDefined();
+    expect(retainedTrack?.visibleThisFrame).toBe(false);
+    expect(retainedTrack?.missedFrames).toBe(1);
+    expect(tracks[0].trackId).toBe(trackId);
+  });
+
+  it('FAT Scenario 12: completed stale track does not attach to the next vehicle', () => {
+    const firstTracks = tracker.updateTracks([{ x: 100, y: 100, width: 90, height: 30, confidence: 0.9 }]);
+    const firstTrack = firstTracks[0];
+    firstTrack.cooldownActive = true;
+
+    tracker.updateTracks([]);
+
+    const nextTracks = tracker.updateTracks([{ x: 100, y: 100, width: 90, height: 30, confidence: 0.9 }]);
+    const visibleTracks = nextTracks.filter((track) => track.visibleThisFrame);
+
+    expect(visibleTracks.length).toBe(1);
+    expect(visibleTracks[0].trackId).not.toBe(firstTrack.trackId);
+  });
+
+  it('FAT Scenario 13: completed lost tracks expire quickly', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+
+    const firstTracks = tracker.updateTracks([{ x: 100, y: 100, width: 90, height: 30, confidence: 0.9 }]);
+    const firstTrack = firstTracks[0];
+    firstTrack.cooldownActive = true;
+
+    vi.setSystemTime(1850);
+    tracker.updateTracks([]);
+
+    expect(tracker.getTrack(firstTrack.trackId)).toBeUndefined();
+  });
+
+  it('FAT Scenario 14: A/B/A reacquisition starts fresh OCR consensus', () => {
+    const carAFirstPass = tracker.updateTracks([{ x: 100, y: 100, width: 90, height: 30, confidence: 0.9 }]);
+    const carAOldTrack = carAFirstPass[0];
+    carAOldTrack.votes.set('AAA1111', { count: 3, totalConfidence: 2.7 });
+    carAOldTrack.stabilizedPlate = 'AAA1111';
+
+    tracker.updateTracks([]);
+
+    const carBPass = tracker.updateTracks([{ x: 104, y: 102, width: 91, height: 30, confidence: 0.9 }]);
+    const carBTrack = carBPass.find((track) => track.trackState === 'VISIBLE');
+
+    expect(carBTrack).toBeDefined();
+    expect(carBTrack?.trackId).not.toBe(carAOldTrack.trackId);
+    expect(carBTrack?.votes.size).toBe(0);
+
+    carBTrack?.votes.set('BBB2222', { count: 3, totalConfidence: 2.7 });
+    carBTrack!.stabilizedPlate = 'BBB2222';
+
+    tracker.updateTracks([]);
+
+    const carAReturnPass = tracker.updateTracks([{ x: 100, y: 100, width: 90, height: 30, confidence: 0.9 }]);
+    const carANewTrack = carAReturnPass.find((track) => track.trackState === 'VISIBLE');
+
+    expect(carANewTrack).toBeDefined();
+    expect(carANewTrack?.trackId).not.toBe(carAOldTrack.trackId);
+    expect(carANewTrack?.trackId).not.toBe(carBTrack?.trackId);
+    expect(Array.from(carANewTrack?.votes.keys() ?? [])).toEqual([]);
+
+    carANewTrack?.votes.set('AAA1111', { count: 1, totalConfidence: 0.9 });
+    expect(Array.from(carANewTrack?.votes.keys() ?? [])).toEqual(['AAA1111']);
   });
 });

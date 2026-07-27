@@ -45,6 +45,14 @@ interface StorageContextType {
 
 const StorageContext = createContext<StorageContextType | undefined>(undefined);
 
+type StoredSystemSettings = Partial<SystemSettings> & { debugMode?: unknown };
+
+function sanitizeSystemSettings(rawSettings: StoredSystemSettings): SystemSettings {
+  const cleanedSettings: StoredSystemSettings = { ...rawSettings };
+  delete cleanedSettings.debugMode;
+  return { ...defaultSettings, ...cleanedSettings };
+}
+
 export const StorageProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [vehicles, setVehicles] = useState<Vehicle[]>(initialVehicles);
   const [users, setUsers] = useState<UserAccount[]>(initialUsers);
@@ -94,7 +102,7 @@ export const StorageProvider: React.FC<{ children: React.ReactNode }> = ({ child
       }
 
       const storedSettings = localStorage.getItem('track_settings');
-      if (storedSettings) setSettings(JSON.parse(storedSettings));
+      if (storedSettings) setSettings(sanitizeSystemSettings(JSON.parse(storedSettings) as StoredSystemSettings));
 
       const storedTheme = localStorage.getItem('track_theme') as ThemeMode;
       if (storedTheme) {
@@ -364,7 +372,7 @@ export const StorageProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
   // Settings
   const updateSettings = (s: Partial<SystemSettings>) => {
-    const updated = { ...settings, ...s };
+    const updated = sanitizeSystemSettings({ ...settings, ...s });
     setSettings(updated);
     localStorage.setItem('track_settings', JSON.stringify(updated));
   };

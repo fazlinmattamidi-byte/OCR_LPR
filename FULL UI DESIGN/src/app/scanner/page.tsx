@@ -447,8 +447,8 @@ export default function ScannerPage() {
   const [isScanning, setIsScanning] = useState(false);
   const [cameraError, setCameraError] = useState('');
   const [soundEnabled, setSoundEnabled] = useState(true);
-  const [currentPlate, setCurrentPlate] = useState('READY');
-  const [lastDetectedSlotId, setLastDetectedSlotId] = useState('');
+  const [, setCurrentPlate] = useState('READY');
+  const [, setLastDetectedSlotId] = useState('');
   const [activeAlertMatch, setActiveAlertMatch] = useState<AlertMatch | null>(null);
   const [liveDetections, setLiveDetections] = useState<SessionDetection[]>([]);
   const [expandedDetectionId, setExpandedDetectionId] = useState<string | null>(null);
@@ -457,10 +457,10 @@ export default function ScannerPage() {
   const [runtimeErrorMessage, setRuntimeErrorMessage] = useState<string | null>(null);
   const [detectorProvider, setDetectorProvider] = useState<ActiveExecutionProvider>('NONE');
   const [ocrProvider, setOcrProvider] = useState<ActiveOcrProvider>('NONE');
-  const [camFps, setCamFps] = useState(0);
-  const [detFps, setDetFps] = useState(0);
-  const [platesVisible, setPlatesVisible] = useState(0);
-  const [activeTracksCount, setActiveTracksCount] = useState(0);
+  const [, setCamFps] = useState(0);
+  const [, setDetFps] = useState(0);
+  const [, setPlatesVisible] = useState(0);
+  const [, setActiveTracksCount] = useState(0);
   const [tracksList, setTracksList] = useState<ActiveTrack[]>([]);
 
   const getSlotRuntime = useCallback((slotId: string): SlotScannerRuntime => {
@@ -1633,14 +1633,6 @@ export default function ScannerPage() {
         </div>
 
         <div className="flex items-center justify-end gap-2">
-            {isScanning && (
-              <div className="hidden lg:flex items-center gap-1.5 font-mono text-[10px] text-slate-400">
-                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">CAM {camFps}</span>
-                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">AI {detFps}</span>
-                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">PLT {platesVisible}</span>
-                <span className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1">TRK {activeTracksCount}</span>
-              </div>
-            )}
             {supportsMultiCameraScan && (
               <button
                 type="button"
@@ -1718,14 +1710,6 @@ export default function ScannerPage() {
         >
           {cameraSlots.map((slot, index) => {
             const slotLabel = getCameraSlotLabel(slot, index);
-            const isActiveSlot = activeCameraSlotId === slot.id;
-            const isScanningSlot =
-              isScanning &&
-              (supportsMultiCameraScan
-                ? previewSlotIds.includes(slot.id)
-                : lastDetectedSlotId
-                  ? lastDetectedSlotId === slot.id
-                  : isActiveSlot);
             const isAlertSlot = activeAlertMatch?.cameraId === slot.id;
 
             return (
@@ -1735,8 +1719,6 @@ export default function ScannerPage() {
                 className={`relative min-h-[420px] sm:min-h-0 rounded-xl overflow-hidden border bg-slate-950 text-left transition-all ${
                   isAlertSlot
                     ? 'border-red-500 ring-2 ring-red-500/40'
-                    : isActiveSlot
-                    ? 'border-cyan-500/70 ring-1 ring-cyan-500/30'
                     : 'border-slate-800'
                 }`}
               >
@@ -1762,14 +1744,6 @@ export default function ScannerPage() {
                   </div>
                 )}
 
-                {isScanningSlot && (
-                  <>
-                    <div className="absolute inset-0 bg-[linear-gradient(rgba(6,182,212,0.10)_1px,transparent_1px),linear-gradient(90deg,rgba(6,182,212,0.10)_1px,transparent_1px)] bg-[size:48px_48px]" />
-                    <div className="absolute inset-x-0 h-0.5 bg-cyan-400/90 animate-laser shadow-[0_0_16px_#06B6D4]" />
-                    <div className="absolute inset-4 border border-cyan-400/40 rounded-lg shadow-[0_0_30px_rgba(6,182,212,0.20)_inset]" />
-                  </>
-                )}
-
                 <canvas
                   ref={(node) => {
                     canvasRefs.current[slot.id] = node;
@@ -1778,7 +1752,6 @@ export default function ScannerPage() {
                 />
 
                 <div className="absolute inset-x-2.5 top-2.5 z-20 flex items-center gap-1.5">
-                  <span className={`h-2 w-2 rounded-full shrink-0 ${isAlertSlot ? 'bg-red-400 animate-pulse' : isScanningSlot ? 'bg-emerald-400 animate-pulse' : previewSlotIds.includes(slot.id) ? 'bg-cyan-400' : 'bg-slate-500'}`} />
                   <select
                     value={slot.deviceId}
                     onClick={(event) => event.stopPropagation()}
@@ -1819,16 +1792,6 @@ export default function ScannerPage() {
                   )}
                 </div>
 
-                {isActiveSlot && (
-                  <div className="absolute bottom-2.5 left-2.5 bg-cyan-950/90 text-cyan-200 border border-cyan-500/60 rounded-lg px-2.5 py-1 text-[10px] font-bold">
-                    {supportsMultiCameraScan && isScanning ? 'Selected view' : 'Active scanner'}
-                  </div>
-                )}
-                {isScanningSlot && (
-                  <div className={`absolute bottom-2.5 ${isActiveSlot ? 'left-32' : 'left-2.5'} bg-slate-900/90 text-cyan-200 border border-cyan-700 rounded-lg px-2.5 py-1 text-[10px] font-mono font-black`}>
-                    {supportsMultiCameraScan && currentPlate === 'SCANNING' ? 'SCANNING' : currentPlate}
-                  </div>
-                )}
                 {supportsMultiCameraScan && (
                   <button
                     type="button"

@@ -9,6 +9,7 @@ const eslintConfig = defineConfig([
     ".next/**",
     "out/**",
     "build/**",
+    "FULL UI DESIGN/**",
     "next-env.d.ts",
     "public/ort-wasm/**",
   ]),

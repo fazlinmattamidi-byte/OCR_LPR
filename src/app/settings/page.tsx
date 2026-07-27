@@ -4,13 +4,9 @@ import React from 'react';
 import { useStorage } from '@/context/StorageContext';
 import { useLanguage } from '@/context/LanguageContext';
 import {
-  Settings,
-  Globe,
   Sun,
   Moon,
-  Sliders,
   Volume2,
-  Info,
 } from 'lucide-react';
 
 export default function SettingsPage() {
@@ -117,6 +113,7 @@ export default function SettingsPage() {
             className="w-4 h-4 accent-cyan-400 cursor-pointer"
           />
         </div>
+
       </div>
 
       {/* About & Version Info Card */}

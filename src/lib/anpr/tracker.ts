@@ -8,6 +8,41 @@ export interface BoundingBox {
   confidence: number;
 }
 
+export type TrackLifecycleState = 'VISIBLE' | 'LOST' | 'REMOVED';
+export type PlatePipelineState =
+  | 'DETECTED'
+  | 'TRACKING'
+  | 'COLLECTING'
+  | 'READY_FOR_OCR'
+  | 'READING'
+  | 'CONSENSUS'
+  | 'MATCHED'
+  | 'COOLDOWN'
+  | 'FINISHED';
+
+export interface TrackConfidenceComponents {
+  detection: number;
+  age: number;
+  motion: number;
+  iou: number;
+  ocr: number;
+}
+
+export interface TrackRuntimeStats {
+  startedAt: number;
+  lastUpdatedAt: number;
+  framesVisible: number;
+  framesLost: number;
+  ocrAttempts: number;
+  ocrAccepted: number;
+  consensusAttempts: number;
+  finalConfidence?: number;
+  finishedAt?: number;
+  lastDetectorLatencyMs?: number;
+  lastOcrLatencyMs?: number;
+  bestCropQuality?: number;
+}
+
 export interface TrackCropSample {
   dataUrl?: string;
   qualityScore: number;
@@ -32,6 +67,14 @@ export interface ActiveTrack {
   lastSeenTimestamp: number;
   firstSeenTimestamp: number;
   framesSeen: number;
+  visibleThisFrame?: boolean;
+  missedFrames?: number;
+  motionScore?: number;
+  trackConfidence?: number;
+  confidenceComponents?: TrackConfidenceComponents;
+  trackState?: TrackLifecycleState;
+  pipelineState?: PlatePipelineState;
+  stats?: TrackRuntimeStats;
 
   ocrState: TrackOcrState;
   ocrRunning: boolean;
@@ -102,13 +145,160 @@ export class PlateTracker {
   private iouThreshold: number = 0.30;
   private lostTrackTimeout: number = 20; // Frames before a confirmed track is pruned (~2s at 10 FPS)
   private lostTrackTimeoutMs: number = 2000; // Time-based expiration in milliseconds (invariant to FPS drops)
+  private completedTrackLostTimeoutMs: number = 800;
   private maxActiveTracks: number = 8;
   private minConfirmationFrames: number = 2;
+
+  private isScaleCompatible(reference: BoundingBox, candidate: BoundingBox): boolean {
+    const widthRatio = candidate.width / Math.max(1, reference.width);
+    const heightRatio = candidate.height / Math.max(1, reference.height);
+    const referenceAspect = reference.width / Math.max(1, reference.height);
+    const candidateAspect = candidate.width / Math.max(1, candidate.height);
+    const aspectRatio = candidateAspect / Math.max(0.1, referenceAspect);
+
+    return (
+      widthRatio >= 0.45 &&
+      widthRatio <= 2.20 &&
+      heightRatio >= 0.45 &&
+      heightRatio <= 2.20 &&
+      aspectRatio >= 0.45 &&
+      aspectRatio <= 2.20
+    );
+  }
+
+  private getAssociationDistanceLimit(track: ActiveTrack, targetBox: BoundingBox, confidence: number): number {
+    const baseSize = Math.max(targetBox.width, targetBox.height, 1);
+    const framesMissing = Math.max(0, this.frameIndex - track.lastSeenFrame - 1);
+    const velocityBoost = Math.min(baseSize * 0.75, Math.hypot(track.vx, track.vy) * Math.max(1, framesMissing + 1));
+    const missedFrameBoost = Math.min(baseSize * 0.45, framesMissing * baseSize * 0.15);
+    const confidenceBoost = confidence >= 0.70 ? baseSize * 0.15 : 0;
+
+    return baseSize * 1.65 + velocityBoost + missedFrameBoost + confidenceBoost;
+  }
+
+  private shouldSkipAssociationAfterGap(track: ActiveTrack): boolean {
+    const frameGap = this.frameIndex - track.lastSeenFrame;
+    const hasOcrMemory = track.cooldownActive || Boolean(track.stabilizedPlate) || track.votes.size > 0;
+
+    if (track.cooldownActive && frameGap > 1) return true;
+    if (hasOcrMemory && frameGap > 1) return true;
+
+    return false;
+  }
+
+  private getOcrStabilityScore(track: ActiveTrack): number {
+    let totalVotes = 0;
+    let topVotes = 0;
+
+    track.votes.forEach((vote) => {
+      totalVotes += vote.count;
+      topVotes = Math.max(topVotes, vote.count);
+    });
+
+    if (totalVotes === 0) return 0.55;
+    return topVotes / totalVotes;
+  }
+
+  private calculateTrackConfidence(
+    track: ActiveTrack,
+    detectorConfidence: number,
+    associationIoU: number
+  ): number {
+    const components: TrackConfidenceComponents = {
+      detection: detectorConfidence,
+      age: Math.min(1, track.framesSeen / 4),
+      motion: 1 - Math.min(1, (track.motionScore ?? 0) / 0.50),
+      iou: associationIoU > 0 ? Math.min(1, associationIoU / 0.50) : 0.55,
+      ocr: this.getOcrStabilityScore(track),
+    };
+
+    const confidence =
+      components.detection * 0.38 +
+      components.age * 0.18 +
+      components.motion * 0.16 +
+      components.iou * 0.16 +
+      components.ocr * 0.12;
+
+    track.confidenceComponents = components;
+    return Math.round(Math.min(1, Math.max(0, confidence)) * 100) / 100;
+  }
+
+  private calculateInitialTrackConfidence(detectorConfidence: number): number {
+    const components: TrackConfidenceComponents = {
+      detection: detectorConfidence,
+      age: 0.25,
+      motion: 1.0,
+      iou: 0.55,
+      ocr: 0.55,
+    };
+
+    const confidence =
+      components.detection * 0.38 +
+      components.age * 0.18 +
+      components.motion * 0.16 +
+      components.iou * 0.16 +
+      components.ocr * 0.12;
+
+    return Math.round(Math.min(1, Math.max(0, confidence)) * 100) / 100;
+  }
+
+  private createInitialConfidenceComponents(detectorConfidence: number): TrackConfidenceComponents {
+    return {
+      detection: detectorConfidence,
+      age: 0.25,
+      motion: 1,
+      iou: 0.55,
+      ocr: 0.55,
+    };
+  }
+
+  private markMatchedTrack(
+    track: ActiveTrack,
+    matchedBox: BoundingBox,
+    velocityAlpha: number,
+    smoothAlpha: number,
+    associationIoU: number
+  ): void {
+    const dx = matchedBox.x - track.bbox.x;
+    const dy = matchedBox.y - track.bbox.y;
+    const motionDenominator = Math.max(1, matchedBox.width, matchedBox.height);
+
+    track.vx = track.vx * (1 - velocityAlpha) + dx * velocityAlpha;
+    track.vy = track.vy * (1 - velocityAlpha) + dy * velocityAlpha;
+    track.motionScore = Math.min(2, Math.hypot(dx, dy) / motionDenominator);
+
+    const now = Date.now();
+    track.bbox = matchedBox;
+
+    // EMA smoothing is only for UI display, so raw crops still use the detector bbox.
+    track.smoothBbox = {
+      x: track.smoothBbox.x * (1 - smoothAlpha) + matchedBox.x * smoothAlpha,
+      y: track.smoothBbox.y * (1 - smoothAlpha) + matchedBox.y * smoothAlpha,
+      width: track.smoothBbox.width * (1 - smoothAlpha) + matchedBox.width * smoothAlpha,
+      height: track.smoothBbox.height * (1 - smoothAlpha) + matchedBox.height * smoothAlpha,
+      confidence: matchedBox.confidence,
+    };
+
+    track.lastSeenFrame = this.frameIndex;
+    track.lastSeenTimestamp = now;
+    track.framesSeen++;
+    track.visibleThisFrame = true;
+    track.missedFrames = 0;
+    track.trackState = 'VISIBLE';
+    if (track.pipelineState === 'DETECTED') track.pipelineState = 'TRACKING';
+    track.trackConfidence = this.calculateTrackConfidence(track, matchedBox.confidence, associationIoU);
+    if (track.stats) {
+      track.stats.framesVisible++;
+      track.stats.lastUpdatedAt = now;
+    }
+    if (track.framesSeen >= this.minConfirmationFrames || track.bbox.confidence >= 0.70) track.isConfirmed = true;
+  }
 
   constructor(lostTrackTimeout?: number, maxActiveTracks?: number, minConfirmationFrames?: number) {
     if (lostTrackTimeout !== undefined) {
       this.lostTrackTimeout = lostTrackTimeout;
       this.lostTrackTimeoutMs = lostTrackTimeout * 100;
+      this.completedTrackLostTimeoutMs = Math.min(800, this.lostTrackTimeoutMs);
     }
     if (maxActiveTracks !== undefined) this.maxActiveTracks = maxActiveTracks;
     if (minConfirmationFrames !== undefined) this.minConfirmationFrames = minConfirmationFrames;
@@ -116,6 +306,12 @@ export class PlateTracker {
 
   public updateTracks(detectedBoxes: BoundingBox[]): ActiveTrack[] {
     this.frameIndex++;
+
+    this.activeTracks.forEach((track) => {
+      track.visibleThisFrame = false;
+      track.missedFrames = Math.max(0, this.frameIndex - track.lastSeenFrame);
+      track.trackState = 'LOST';
+    });
 
     // 1. Separate detections into High Confidence and Low Confidence
     const highConfDets: { box: BoundingBox; idx: number }[] = [];
@@ -146,15 +342,20 @@ export class PlateTracker {
 
     // 3. First Stage Association: Match Active Tracks with High Confidence Detections
     this.activeTracks.forEach((track) => {
+      if (this.shouldSkipAssociationAfterGap(track)) return;
+
       let bestMatchScore = 0;
       let bestIdx = -1;
+      let bestIoU = 0;
 
       highConfDets.forEach(({ box, idx }) => {
         if (!unassignedHigh.has(idx)) return;
         const targetBox = track.predictedBbox || track.bbox;
+        if (!this.isScaleCompatible(targetBox, box)) return;
+
         const iou = calculateIoU(targetBox, box);
         const dist = calculateCentroidDistance(targetBox, box);
-        const maxDist = Math.max(targetBox.width, targetBox.height) * 3.0; // Allow jump up to 3.0x size for slow detectors
+        const maxDist = this.getAssociationDistanceLimit(track, targetBox, box.confidence);
 
         let score = 0;
         if (iou > this.iouThreshold) {
@@ -166,35 +367,13 @@ export class PlateTracker {
         if (score > bestMatchScore) {
           bestMatchScore = score;
           bestIdx = idx;
+          bestIoU = iou;
         }
       });
 
       if (bestIdx !== -1) {
         const matchedBox = detectedBoxes[bestIdx];
-        // Calculate velocity update
-        const dx = matchedBox.x - track.bbox.x;
-        const dy = matchedBox.y - track.bbox.y;
-        track.vx = track.vx * 0.7 + dx * 0.3; // Smooth velocity
-        track.vy = track.vy * 0.7 + dy * 0.3;
-
-        const now = Date.now();
-        track.bbox = matchedBox;
-
-        // EMA smoothing for UI display — alpha=0.35 glides toward new position
-        // without snapping, so camera shake doesn't make overlay boxes jump.
-        const a = 0.35;
-        track.smoothBbox = {
-          x: track.smoothBbox.x * (1 - a) + matchedBox.x * a,
-          y: track.smoothBbox.y * (1 - a) + matchedBox.y * a,
-          width: track.smoothBbox.width * (1 - a) + matchedBox.width * a,
-          height: track.smoothBbox.height * (1 - a) + matchedBox.height * a,
-          confidence: matchedBox.confidence,
-        };
-
-        track.lastSeenFrame = this.frameIndex;
-        track.lastSeenTimestamp = now;
-        track.framesSeen++;
-        if (track.framesSeen >= this.minConfirmationFrames || track.bbox.confidence >= 0.70) track.isConfirmed = true;
+        this.markMatchedTrack(track, matchedBox, 0.30, 0.35, bestIoU);
         unassignedHigh.delete(bestIdx);
       }
     });
@@ -202,16 +381,20 @@ export class PlateTracker {
     // 4. Second Stage Association: Match Unassigned Tracks with Low Confidence Detections
     this.activeTracks.forEach((track) => {
       if (track.lastSeenFrame === this.frameIndex) return; // Already updated in Stage 1
+      if (this.shouldSkipAssociationAfterGap(track)) return;
 
       let bestMatchScore = 0;
       let bestIdx = -1;
+      let bestIoU = 0;
 
       lowConfDets.forEach(({ box, idx }) => {
         if (!unassignedLow.has(idx)) return;
         const targetBox = track.predictedBbox || track.bbox;
+        if (!this.isScaleCompatible(targetBox, box)) return;
+
         const iou = calculateIoU(targetBox, box);
         const dist = calculateCentroidDistance(targetBox, box);
-        const maxDist = Math.max(targetBox.width, targetBox.height) * 3.0;
+        const maxDist = this.getAssociationDistanceLimit(track, targetBox, box.confidence) * 0.85;
 
         let score = 0;
         if (iou > this.iouThreshold * 0.8) {
@@ -223,32 +406,13 @@ export class PlateTracker {
         if (score > bestMatchScore) {
           bestMatchScore = score;
           bestIdx = idx;
+          bestIoU = iou;
         }
       });
 
       if (bestIdx !== -1) {
         const matchedBox = detectedBoxes[bestIdx];
-        const dx = matchedBox.x - track.bbox.x;
-        const dy = matchedBox.y - track.bbox.y;
-        track.vx = track.vx * 0.75 + dx * 0.25;
-        track.vy = track.vy * 0.75 + dy * 0.25;
-
-        track.bbox = matchedBox;
-
-        // EMA smoothing for stage-2 (low confidence) matches too
-        const a = 0.25; // Slightly less aggressive for low-conf matches
-        track.smoothBbox = {
-          x: track.smoothBbox.x * (1 - a) + matchedBox.x * a,
-          y: track.smoothBbox.y * (1 - a) + matchedBox.y * a,
-          width: track.smoothBbox.width * (1 - a) + matchedBox.width * a,
-          height: track.smoothBbox.height * (1 - a) + matchedBox.height * a,
-          confidence: matchedBox.confidence,
-        };
-
-        track.lastSeenFrame = this.frameIndex;
-        track.lastSeenTimestamp = Date.now();
-        track.framesSeen++;
-        if (track.framesSeen >= this.minConfirmationFrames || track.bbox.confidence >= 0.70) track.isConfirmed = true;
+        this.markMatchedTrack(track, matchedBox, 0.25, 0.25, bestIoU);
         unassignedLow.delete(bestIdx);
       }
     });
@@ -276,6 +440,22 @@ export class PlateTracker {
         lastSeenTimestamp: now,
         firstSeenTimestamp: now,
         framesSeen: 1,
+        visibleThisFrame: true,
+        missedFrames: 0,
+        motionScore: 0,
+        trackConfidence: this.calculateInitialTrackConfidence(box.confidence),
+        confidenceComponents: this.createInitialConfidenceComponents(box.confidence),
+        trackState: 'VISIBLE',
+        pipelineState: 'DETECTED',
+        stats: {
+          startedAt: now,
+          lastUpdatedAt: now,
+          framesVisible: 1,
+          framesLost: 0,
+          ocrAttempts: 0,
+          ocrAccepted: 0,
+          consensusAttempts: 0,
+        },
         ocrState: 'DETECTED',
         ocrRunning: false,
         ocrJobQueued: false,
@@ -290,9 +470,28 @@ export class PlateTracker {
     const now = Date.now();
     this.activeTracks.forEach((track, id) => {
       const timeLostMs = now - (track.lastSeenTimestamp || 0);
-      const timeoutMs = track.isConfirmed ? this.lostTrackTimeoutMs : 600; // Unconfirmed expire quickly (600ms)
+      const timeoutMs = track.isConfirmed
+        ? track.cooldownActive
+          ? this.completedTrackLostTimeoutMs
+          : this.lostTrackTimeoutMs
+        : 600; // Unconfirmed expire quickly (600ms)
       if (timeLostMs > timeoutMs) {
+        track.trackState = 'REMOVED';
+        track.pipelineState = track.cooldownActive ? 'FINISHED' : track.pipelineState;
+        if (track.stats) {
+          track.stats.finishedAt = now;
+          track.stats.finalConfidence = track.stabilizedConfidence ?? track.trackConfidence;
+          track.stats.lastUpdatedAt = now;
+        }
         this.activeTracks.delete(id);
+      } else if (!track.visibleThisFrame) {
+        track.missedFrames = Math.max(1, this.frameIndex - track.lastSeenFrame);
+        track.trackState = 'LOST';
+        track.trackConfidence = Math.round(Math.max(0, (track.trackConfidence ?? 0) * 0.65) * 100) / 100;
+        if (track.stats) {
+          track.stats.framesLost++;
+          track.stats.lastUpdatedAt = now;
+        }
       }
     });
 
@@ -312,6 +511,7 @@ export class PlateTracker {
   public setLostTrackTimeout(frames: number): void {
     this.lostTrackTimeout = frames;
     this.lostTrackTimeoutMs = frames * 100;
+    this.completedTrackLostTimeoutMs = Math.min(800, this.lostTrackTimeoutMs);
   }
 
   public setMaxActiveTracks(maxTracks: number): void {

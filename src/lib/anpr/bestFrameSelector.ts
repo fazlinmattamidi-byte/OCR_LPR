@@ -55,7 +55,7 @@ export class BestFrameSelector {
     this.trackBuffers.set(trackId, fresh);
   }
 
-  private pruneOverflowTracks(now: number): void {
+  private pruneOverflowTracks(): void {
     if (this.trackBuffers.size <= this.maxTrackBuffers) return;
 
     const ranked = Array.from(this.trackBuffers.entries()).sort((a, b) => {
@@ -103,7 +103,7 @@ export class BestFrameSelector {
       if (removed) this.releaseEntry(removed);
     }
 
-    this.pruneOverflowTracks(now);
+    this.pruneOverflowTracks();
 
     return quality;
   }
@@ -126,6 +126,15 @@ export class BestFrameSelector {
       }
     }
     return best;
+  }
+
+  /**
+   * Return the number of fresh crop candidates currently buffered for a track.
+   */
+  public getCropCount(trackId: number): number {
+    const now = Date.now();
+    this.pruneTrackBuffer(trackId, now);
+    return this.trackBuffers.get(trackId)?.length ?? 0;
   }
 
   /**
@@ -179,7 +188,7 @@ export class BestFrameSelector {
       }
     }
 
-    this.pruneOverflowTracks(now);
+    this.pruneOverflowTracks();
   }
 
   /**
