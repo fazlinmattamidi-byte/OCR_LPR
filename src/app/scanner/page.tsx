@@ -2903,7 +2903,15 @@ export default function ScannerPage() {
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
                   <span className="font-mono text-sm font-black text-cyan-300">{latestDetection.plate}</span>
-                  <span className="text-[10px] font-black uppercase tracking-wider text-slate-300">
+                  <span
+                    className={`rounded-md px-1.5 py-0.5 text-[10px] font-black uppercase tracking-wider ${
+                      latestResultTone === 'EXACT'
+                        ? 'bg-red-600 text-white'
+                        : latestResultTone === 'POSSIBLE'
+                        ? 'bg-amber-500 text-slate-950'
+                        : 'border border-slate-700 bg-slate-950 text-slate-100'
+                    }`}
+                  >
                     {latestResultTone === 'EXACT'
                       ? language === 'BM'
                         ? 'Padanan kes'
@@ -2913,8 +2921,8 @@ export default function ScannerPage() {
                         ? 'Semakan'
                         : 'Possible'
                       : language === 'BM'
-                      ? 'Tiada padanan'
-                      : 'No match'}
+                      ? 'TIADA PADANAN'
+                      : 'NOT MATCH'}
                   </span>
                 </div>
                 <div className="truncate text-[10px] text-slate-400">
@@ -3248,7 +3256,7 @@ export default function ScannerPage() {
                     ) : (
                       <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold uppercase bg-slate-900 text-slate-400 border border-slate-800 inline-flex items-center gap-1">
                         <XCircle className="w-2.5 h-2.5" />
-                        <span>{language === 'BM' ? 'TIADA' : 'NO MATCH'}</span>
+                        <span>{language === 'BM' ? 'TIADA PADANAN' : 'NOT MATCH'}</span>
                       </span>
                     )}
                   </div>
@@ -3304,7 +3312,7 @@ export default function ScannerPage() {
                         ) : (
                           <span className="px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold uppercase bg-slate-950 text-slate-400 border border-slate-800 inline-flex items-center gap-1">
                             <XCircle className="w-3 h-3" />
-                            <span>{language === 'BM' ? 'TIADA PADANAN' : 'UNMATCHED'}</span>
+                            <span>{language === 'BM' ? 'TIADA PADANAN' : 'NOT MATCH'}</span>
                           </span>
                         )}
                       </td>
